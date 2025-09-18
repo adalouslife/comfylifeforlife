@@ -1,0 +1,14 @@
+shared_models:
+  base_path: /runpod-volume/models
+  checkpoints: models/checkpoints
+  vae: models/vae
+  loras: models/loras
+  diffusion_models: models/diffusion_models
+  unet: models/unet
+  controlnet: models/controlnet
+  clip: models/clip
+  clip_vision: models/clip_vision
+  embeddings: models/embeddings
+  upscale_models: models/upscale_models
+  face_parsing: models/face_parsing
+  insightface: models/insightface
