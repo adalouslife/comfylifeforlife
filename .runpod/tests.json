@@ -1,32 +1,19 @@
 {
   "tests": [
     {
-      "name": "validation_text_input",
+      "name": "faceswap_smoke_urls",
       "input": {
-        "text": "Hello world",
-        "language": "en"
+        "input": {
+          "source_url": "https://raw.githubusercontent.com/runpod/serverless-workers/main/examples/images/person1.jpg",
+          "target_url": "https://raw.githubusercontent.com/runpod/serverless-workers/main/examples/images/person2.jpg"
+        }
       },
-      "timeout": 10000
+      "timeout": 300000
     }
   ],
   "config": {
     "gpuTypeId": "NVIDIA GeForce RTX 4090",
     "gpuCount": 1,
-    "env": [
-      {
-        "key": "ENV_KEY_HERE",
-        "value": "ENV_VALUE_HERE"
-      }
-    ],
-    "allowedCudaVersions": [
-      "12.7",
-      "12.6",
-      "12.5",
-      "12.4",
-      "12.3",
-      "12.2",
-      "12.1",
-      "12.0"
-    ]
+    "allowedCudaVersions": ["11.8", "12.1", "12.4"]
   }
 }
