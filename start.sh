@@ -8,18 +8,8 @@ COMFY_DIR="/workspace/ComfyUI"
 MODEL_DOWNLOADER="/workspace/download_models.sh"
 CUSTOM_NODE_INSTALLER="/workspace/install_custom_nodes.py"
 HANDLER="/workspace/handler.py"
-EXTRA_YAML_SRC="/workspace/comfyui/extra_model_paths.yaml"
-EXTRA_YAML_DST="${COMFY_DIR}/extra_model_paths.yaml"
 
 echo "[start] worker starting at $(date)"
-
-# 0) Ensure ComfyUI knows about /runpod-volume/models via extra_model_paths.yaml
-if [ -f "${EXTRA_YAML_SRC}" ]; then
-  echo "[start] syncing extra_model_paths.yaml into ComfyUI..."
-  cp -f "${EXTRA_YAML_SRC}" "${EXTRA_YAML_DST}" || echo "[warn] failed to copy extra_model_paths.yaml"
-else
-  echo "[warn] comfyui/extra_model_paths.yaml not found — ComfyUI may not see /runpod-volume/models"
-fi
 
 # 1) Run model downloader
 if [ -x "${MODEL_DOWNLOADER}" ]; then
@@ -29,7 +19,7 @@ else
   echo "[warn] no download_models.sh found"
 fi
 
-# 2) Install custom nodes (optional)
+# 2) Install custom nodes
 if [ -f "${CUSTOM_NODE_INSTALLER}" ]; then
   echo "[start] installing custom nodes ..."
   python3 "${CUSTOM_NODE_INSTALLER}" || { echo "[error] install_custom_nodes.py failed"; exit 1; }
@@ -52,6 +42,22 @@ else
   exit 1
 fi
 
-# 4) Finally start RunPod handler (blocks here)
+# 4) Wait for ComfyUI to be ready
+COMFY_URL="http://127.0.0.1:8188"
+echo "[start] waiting for ComfyUI at ${COMFY_URL} ..."
+for i in $(seq 1 60); do
+  if curl -sSf "${COMFY_URL}" >/dev/null 2>&1; then
+    echo "[start] ComfyUI is up"
+    break
+  fi
+  echo "[start] waiting... (${i}/60)"
+  sleep 2
+done
+
+# 5) Stream ComfyUI logs in background (optional but helpful)
+tail -n 50 -f /workspace/comfyui.log &
+TAIL_PID=$!
+
+# 6) Finally start RunPod handler (blocks here)
 echo "[start] launching runpod handler ..."
 exec python3 "${HANDLER}"
