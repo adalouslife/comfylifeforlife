@@ -1,0 +1,17 @@
+{
+  "tests": [
+    {
+      "name": "smoke_offline",
+      "input": {
+        "op": "health_check"
+      },
+      "timeout": 20000
+    }
+  ],
+  "config": {
+    "cpuFlavor": "CPU-2C-4GB",
+    "env": [
+      { "key": "RUNPOD_TEST_MODE", "value": "true" }
+    ]
+  }
+}
