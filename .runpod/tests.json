@@ -1,0 +1,17 @@
+{
+  "tests": [
+    {
+      "name": "gpu_boot_smoke_v2",
+      "input": { "op": "health_check", "reason": "publish_smoke" },
+      "timeout": 15000
+    }
+  ],
+  "config": {
+    "runsOn": "GPU",
+    "gpuCount": 1,
+    "env": [
+      { "key": "RUNPOD_TEST_MODE", "value": "true" },
+      { "key": "RP_HEALTH_ONLY", "value": "true" }
+    ]
+  }
+}
