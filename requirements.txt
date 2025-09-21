@@ -1,9 +1,4 @@
-runpod
-requests
-fastapi
-uvicorn
-pydantic
-Pillow
-numpy
-opencv-python-headless
-tqdm
+fastapi==0.115.0
+uvicorn==0.30.6
+httpx==0.27.2
+pydantic==2.9.2
