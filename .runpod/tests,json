@@ -5,7 +5,7 @@
       "input": {
         "op": "health_check"
       },
-      "timeout": 20000
+      "timeout": 10000
     }
   ],
   "config": {
