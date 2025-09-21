@@ -1,194 +1,210 @@
-#!/usr/bin/env python3
-import base64, io, json, os, time, typing as T
-from dataclasses import dataclass
-import requests, runpod
+import os, time, json, base64, tempfile, requests, shutil, threading, subprocess
+import runpod
 
-# ----- Config -----
-COMFY_URL = os.environ.get("COMFY_URL", "http://127.0.0.1:8188")
-WORKFLOW_PATH = "/workspace/comfyui/workflows/APIAutoFaceACE.json"
-UPLOAD_ENDPOINT  = f"{COMFY_URL}/upload/image"
-PROMPT_ENDPOINT  = f"{COMFY_URL}/prompt"
-HISTORY_ENDPOINT = f"{COMFY_URL}/history"
-VIEW_ENDPOINT    = f"{COMFY_URL}/view"
-HTTP_TIMEOUT = (5, 60)
-CLIENT_ID = "runpod-worker"
+COMFY_HOST = os.getenv("COMFYUI_HOST", "127.0.0.1")
+COMFY_PORT = int(os.getenv("COMFYUI_PORT", "8188"))
+COMFY_URL  = f"http://{COMFY_HOST}:{COMFY_PORT}"
 
-def _b64_to_bytes(s: str) -> bytes:
-    s = s.strip()
-    if s.startswith("data:"):
-        s = s.split(",", 1)[1]
-    return base64.b64decode(s)
+# Directories — adjust if your ComfyUI lives elsewhere
+COMFY_ROOT        = os.getenv("COMFYUI_ROOT", "/workspace/ComfyUI")
+COMFY_INPUT_DIR   = os.getenv("COMFYUI_INPUT_DIR", f"{COMFY_ROOT}/input")
+COMFY_OUTPUT_DIR  = os.getenv("COMFYUI_OUTPUT_DIR", f"{COMFY_ROOT}/output")
+WORKFLOW_FILE     = os.getenv("WORKFLOW_FILE", "/app/workflows/faceswap_api.json")
 
-def _get_bytes_from_url(url: str) -> bytes:
-    r = requests.get(url, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    return r.content
+# Optional Network Volume for models/cache (default RunPod mount)
+NV_MOUNT = os.getenv("VOLUME_MOUNT", "/runpod-volume")
+USE_NV   = os.getenv("USE_NETWORK_VOLUME", "true").lower() == "true"
+NV_MODELS_PATH = os.getenv("NV_MODELS_PATH", f"{NV_MOUNT}/models/ComfyUI")  # your shared models
+COMFY_MODELS_PATH = os.getenv("COMFYUI_MODELS_PATH", f"{COMFY_ROOT}/models")
 
-def _upload(name_hint: str, data: bytes) -> str:
-    files = {"image": (name_hint, io.BytesIO(data), "application/octet-stream")}
-    r = requests.post(UPLOAD_ENDPOINT, files=files, timeout=HTTP_TIMEOUT)
-    try:
-        r.raise_for_status()
-        js = r.json()
-        if isinstance(js, dict) and "name" in js:
-            return js["name"]
-        if isinstance(js, list) and js and isinstance(js[0], dict) and "name" in js[0]:
-            return js[0]["name"]
-        if isinstance(js, str):
-            return js.strip()
-        raise RuntimeError(f"Unexpected upload response: {js}")
-    except Exception:
-        if r.status_code == 200 and r.text.strip():
-            return r.text.strip()
-        raise
+TEST_MODE = os.getenv("RUNPOD_TEST_MODE", "false").lower() == "true"
 
-def _load_workflow(path: str) -> dict:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Workflow not found at {path}")
-    with open(path, "r", encoding="utf-8") as f:
-        wf = json.load(f)
-    # Ensure shape for /prompt: {"prompt": {...}, "client_id": "..."}
-    if not isinstance(wf, dict) or "prompt" not in wf:
-        wf = {"prompt": wf}
-    if "client_id" not in wf:
-        wf["client_id"] = CLIENT_ID
-    return wf
+def _symlink_models_once():
+    if not USE_NV:
+        return
+    os.makedirs(NV_MODELS_PATH, exist_ok=True)
+    os.makedirs(os.path.dirname(COMFY_MODELS_PATH), exist_ok=True)
+    # Replace models dir with symlink to the Network Volume
+    if os.path.islink(COMFY_MODELS_PATH):
+        return
+    if os.path.exists(COMFY_MODELS_PATH):
+        # move any pre-downloaded models to NV to preserve them
+        tmp = f"{NV_MODELS_PATH}/_import_once"
+        os.makedirs(tmp, exist_ok=True)
+        for name in os.listdir(COMFY_MODELS_PATH):
+            src = os.path.join(COMFY_MODELS_PATH, name)
+            dst = os.path.join(tmp, name)
+            if not os.path.exists(dst):
+                shutil.move(src, dst)
+        shutil.rmtree(COMFY_MODELS_PATH)
+    os.symlink(NV_MODELS_PATH, COMFY_MODELS_PATH)
 
-def _find_image_nodes(graph: dict) -> T.List[T.Tuple[str, dict]]:
-    # Accept both {"prompt":{nodes...}} and flat; operate on wf["prompt"]
-    nodes_obj = (graph.get("prompt") if "prompt" in graph else graph)
-    # nodes may be dict keyed by node_id or list of nodes
-    if isinstance(nodes_obj, dict) and "nodes" in nodes_obj:
-        nodes_iter = nodes_obj["nodes"].items() if isinstance(nodes_obj["nodes"], dict) \
-                     else ((str(n.get("id", i)), n) for i, n in enumerate(nodes_obj["nodes"]))
-    else:
-        nodes_iter = nodes_obj.items() if isinstance(nodes_obj, dict) else []
+def _start_comfy_background():
+    _symlink_models_once()
+    # Ensure input/output exist
+    os.makedirs(COMFY_INPUT_DIR, exist_ok=True)
+    os.makedirs(COMFY_OUTPUT_DIR, exist_ok=True)
 
-    found = []
-    for node_id, node in nodes_iter:
-        inputs = node.get("inputs", {}) if isinstance(node, dict) else {}
-        if isinstance(inputs, dict):
-            for k in inputs.keys():
-                if k.lower().startswith("image"):
-                    found.append((str(node_id), node))
-                    break
-    return found
+    # Launch ComfyUI headless in background
+    # If your ComfyUI path differs, adjust python entry and args.
+    cmd = [
+        "python", f"{COMFY_ROOT}/main.py",
+        "--listen", "127.0.0.1",
+        "--port", str(COMFY_PORT),
+        "--disable-auto-launch"
+    ]
+    # You can add: "--force-fp16", "--lowvram", etc. from env if needed
+    extra = os.getenv("COMFY_EXTRA_ARGS", "")
+    if extra.strip():
+        cmd += extra.split()
 
-def _inject_filenames(payload: dict, mapping: T.List[T.Tuple[str, str, str]]) -> dict:
-    # Operate on payload["prompt"]
-    prompt = payload["prompt"]
-    nodes = prompt.get("nodes") or prompt
-    updated = 0
-    if isinstance(nodes, dict):
-        for node_id, key, fname in mapping:
-            node = nodes.get(node_id)
-            if node and isinstance(node.get("inputs"), dict):
-                node["inputs"][key] = fname
-                updated += 1
-    else:
-        for node_id, key, fname in mapping:
-            for node in nodes:
-                if str(node.get("id")) == str(node_id) and isinstance(node.get("inputs"), dict):
-                    node["inputs"][key] = fname
-                    updated += 1
-                    break
-    if updated == 0:
-        raise RuntimeError("No workflow inputs were updated — check node IDs / keys.")
-    return payload
+    def run():
+        subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
-def _post_prompt(payload: dict) -> str:
-    r = requests.post(PROMPT_ENDPOINT, json=payload, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    js = r.json()
-    pid = js.get("prompt_id") or js.get("promptId") or js.get("id")
-    if not pid:
-        raise RuntimeError(f"Missing prompt_id in response: {js}")
-    return pid
+    threading.Thread(target=run, daemon=True).start()
 
-@dataclass
-class OutputImage:
-    filename: str
-    subfolder: str
-    type_: str
-
-def _wait_for_result(pid: str, timeout_s: int = 300) -> T.List[OutputImage]:
+def _wait_for_comfy(timeout=120):
     t0 = time.time()
-    while True:
-        r = requests.get(f"{HISTORY_ENDPOINT}/{pid}", timeout=HTTP_TIMEOUT)
-        if r.status_code == 404:
-            time.sleep(0.8)
-        else:
-            r.raise_for_status()
-            js = r.json()
-            hist = js.get("history") or {}
-            entry = hist.get(pid) or {}
-            outputs = entry.get("outputs") or {}
-            imgs: T.List[OutputImage] = []
-            for _, node_out in outputs.items():
-                for im in (node_out.get("images") or []):
-                    imgs.append(OutputImage(
-                        filename=im.get("filename"),
-                        subfolder=im.get("subfolder", ""),
-                        type_=im.get("type", "output"),
-                    ))
-            if imgs:
-                return imgs
-            time.sleep(0.8)
-        if time.time() - t0 > timeout_s:
-            raise TimeoutError(f"Timed out after {timeout_s}s")
+    while time.time() - t0 < timeout:
+        try:
+            r = requests.get(f"{COMFY_URL}/system_stats", timeout=2)
+            if r.ok:
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
+    return False
 
-def _download_b64(img: OutputImage) -> str:
-    params = {"filename": img.filename}
-    if img.subfolder: params["subfolder"] = img.subfolder
-    if img.type_:     params["type"] = img.type_
-    rr = requests.get(VIEW_ENDPOINT, params=params, timeout=HTTP_TIMEOUT)
-    rr.raise_for_status()
-    return base64.b64encode(rr.content).decode("utf-8")
+def _load_workflow():
+    with open(WORKFLOW_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)  # must be the dict of nodes keyed by string ids
 
-def rp_handler(event):
+def _save_input_image_from_base64(b64_str, filename):
+    data = base64.b64decode(b64_str)
+    with open(os.path.join(COMFY_INPUT_DIR, filename), "wb") as f:
+        f.write(data)
+
+def _save_input_image_from_url(url, filename):
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    with open(os.path.join(COMFY_INPUT_DIR, filename), "wb") as f:
+        f.write(r.content)
+
+def _submit_prompt(prompt_graph):
+    r = requests.post(f"{COMFY_URL}/prompt", json={"prompt": prompt_graph}, timeout=30)
+    r.raise_for_status()
+    return r.json()["prompt_id"]
+
+def _wait_for_history(prompt_id, timeout=600):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        r = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=10)
+        if r.ok:
+            j = r.json()
+            if prompt_id in j:
+                return j[prompt_id]  # full history dict
+        time.sleep(1.5)
+    raise TimeoutError("ComfyUI job timed out")
+
+def _extract_output_images(history_obj):
+    """Returns list of dicts: [{filename, subfolder, type}]"""
+    # ComfyUI history structure varies by nodes; we scan all nodes
+    outputs = []
+    for node_id, node_data in history_obj.get("outputs", {}).items():
+        for img in node_data.get("images", []):
+            if img.get("type") == "output":
+                outputs.append({"filename": img["filename"],
+                                "subfolder": img.get("subfolder", ""),
+                                "type": img["type"]})
+    return outputs
+
+def _fetch_image_b64(filename, subfolder=""):
+    params = {"filename": filename}
+    if subfolder:
+        params["subfolder"] = subfolder
+    # /view serves the image file
+    r = requests.get(f"{COMFY_URL}/view", params=params, timeout=30)
+    r.raise_for_status()
+    return base64.b64encode(r.content).decode("ascii")
+
+# ---------------- RunPod handler ----------------
+
+def handler(event):
+    """
+    Expected inputs for real runs (examples):
+    {
+      "mode": "faceswap",
+      "source_image_b64": "...",
+      "target_image_b64": "..."
+      # OR:
+      "source_image_url": "https://.../src.png",
+      "target_image_url": "https://.../dst.png"
+    }
+
+    For smoke tests:
+    { "op": "health_check" }
+    """
+    # 1) fast path for tests
+    if TEST_MODE and (event.get("op") == "health_check" or event.get("mode") == "smoke"):
+        return {"ok": True, "message": "Test mode passed ✅"}
+
+    # 2) ensure ComfyUI is up
+    if not _wait_for_comfy(timeout=180):
+        return {"ok": False, "error": "ComfyUI did not become ready in time."}
+
+    # 3) ingest images
+    source_name = "source.png"
+    target_name = "target.png"
+
     try:
-        inp = (event or {}).get("input") or {}
-        if "source_b64" in inp: src = _b64_to_bytes(inp["source_b64"])
-        elif "source_url" in inp: src = _get_bytes_from_url(inp["source_url"])
-        else: return {"error": "Provide 'source_b64' or 'source_url'."}
-
-        if "target_b64" in inp: tgt = _b64_to_bytes(inp["target_b64"])
-        elif "target_url" in inp: tgt = _get_bytes_from_url(inp["target_url"])
-        else: return {"error": "Provide 'target_b64' or 'target_url'."}
-
-        src_name = _upload("source.png", src)
-        tgt_name = _upload("target.png", tgt)
-
-        payload = _load_workflow(WORKFLOW_PATH)
-
-        mapping = inp.get("node_mapping")
-        plan: T.List[T.Tuple[str, str, str]] = []
-        if mapping and isinstance(mapping, dict):
-            s = mapping.get("source"); t = mapping.get("target")
-            if not (s and t): return {"error": "node_mapping must include 'source' and 'target'."}
-            plan.append((str(s["node_id"]), str(s["input_key"]), src_name))
-            plan.append((str(t["node_id"]), str(t["input_key"]), tgt_name))
+        if "source_image_b64" in event:
+            _save_input_image_from_base64(event["source_image_b64"], source_name)
+        elif "source_image_url" in event:
+            _save_input_image_from_url(event["source_image_url"], source_name)
         else:
-            # auto-pick first two image inputs
-            cand = _find_image_nodes(payload)
-            if len(cand) < 2:
-                return {"error": "Could not find two image input nodes; provide 'node_mapping'."}
-            def first_key(nd: dict) -> str:
-                for k in (nd.get("inputs") or {}):
-                    if k.lower().startswith("image"):
-                        return k
-                raise KeyError("image key not found")
-            (sid, s_node), (tid, t_node) = cand[0], cand[1]
-            plan.append((sid, first_key(s_node), src_name))
-            plan.append((tid, first_key(t_node), tgt_name))
+            return {"ok": False, "error": "Missing source image (base64 or url)."}
 
-        payload = _inject_filenames(payload, plan)
-
-        pid = _post_prompt(payload)
-        images = _wait_for_result(pid, timeout_s=300)
-        outs = [_download_b64(img) for img in images]
-        return {"status": "ok", "prompt_id": pid, "count": len(outs), "outputs_base64": outs}
+        if "target_image_b64" in event:
+            _save_input_image_from_base64(event["target_image_b64"], target_name)
+        elif "target_image_url" in event:
+            _save_input_image_from_url(event["target_image_url"], target_name)
+        else:
+            return {"ok": False, "error": "Missing target image (base64 or url)."}
     except Exception as e:
-        return {"error": f"{type(e).__name__}: {e}"}
+        return {"ok": False, "error": f"Failed to load inputs: {e}"}
 
-runpod.serverless.start({"handler": rp_handler})
+    # 4) load workflow template and submit
+    try:
+        graph = _load_workflow()
+        # IMPORTANT: your workflow must contain two LoadImage nodes with
+        # inputs.image == "source.png" and "target.png".
+        # If you prefer dynamic injection, you can edit the graph here.
+        prompt_id = _submit_prompt(graph)
+        history = _wait_for_history(prompt_id)
+        outs = _extract_output_images(history)
+        if not outs:
+            return {"ok": False, "error": "No output images found in history."}
+        # return first output (or all)
+        images_b64 = []
+        for meta in outs:
+            b64 = _fetch_image_b64(meta["filename"], meta.get("subfolder", ""))
+            images_b64.append({
+                "filename": meta["filename"],
+                "image_base64": b64
+            })
+        return {"ok": True, "images": images_b64}
+    except requests.HTTPError as e:
+        # Helpful error surface if /prompt rejects the payload
+        try:
+            detail = e.response.text[:400]
+        except Exception:
+            detail = str(e)
+        return {"ok": False, "error": f"ComfyUI HTTPError: {e}", "detail": detail}
+    except Exception as e:
+        return {"ok": False, "error": f"Unhandled: {e}"}
+
+def _bootstrap():
+    _start_comfy_background()
+
+# Start RunPod serverless with on_start so ComfyUI launches on cold start
+runpod.serverless.start({"handler": handler, "on_start": _bootstrap})
