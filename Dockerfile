@@ -1,38 +1,46 @@
-# --------------------------
-# ComfyUI RunPod Serverless
-# --------------------------
+# --------------------------------------------
+# ComfyUI RunPod Serverless Worker (FaceSwap)
+# --------------------------------------------
 
-# Valid, existing RunPod base image (CUDA 12.1, Python 3.10, Torch 2.1.1)
-FROM runpod/pytorch:2.1.1-py3.10-cuda12.1.1-devel-ubuntu22.04
+# 1) Base image with CUDA + Python (matches RunPod GPU environment)
+FROM runpod/base:0.4.0-cuda12.1.105
 
+# 2) Environment setup
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    WORKSPACE=/workspace
+    WORKSPACE=/workspace \
+    COMFYUI_ROOT=/workspace/ComfyUI \
+    COMFYUI_INPUT_DIR=/workspace/ComfyUI/input \
+    COMFYUI_OUTPUT_DIR=/workspace/ComfyUI/output \
+    COMFYUI_MODELS_PATH=/workspace/ComfyUI/models \
+    WORKFLOW_FILE=/app/workflows/faceswap_api.json
 
 WORKDIR $WORKSPACE
 
-# System deps (git/curl/wget/zip + common libs many nodes need)
+# 3) Install system deps
 RUN apt-get update && apt-get install -y \
-    git wget curl zip ffmpeg libgl1 \
-    && rm -rf /var/lib/apt/lists/*
+    git wget curl zip \
+ && rm -rf /var/lib/apt/lists/*
 
-# ComfyUI
+# 4) Install ComfyUI
 RUN git clone https://github.com/comfyanonymous/ComfyUI.git ComfyUI
 
-# Python deps (pin requests to avoid surprises)
+# 5) Install Python deps
 RUN pip install --upgrade pip setuptools wheel \
  && pip install -r ComfyUI/requirements.txt \
- && pip install runpod requests==2.32.3
+ && pip install runpod requests
 
-# Your repo files -> /workspace
-COPY . $WORKSPACE
+# 6) Copy repo files
+# (Assumes your repo has handler.py, start.sh, workflows/, etc.)
+COPY . /app
+WORKDIR /app
 
-# Ensure scripts are executable
-RUN chmod +x $WORKSPACE/*.sh || true
+# Ensure shell scripts are executable
+RUN chmod +x /app/*.sh
 
-# ComfyUI port (optional for debugging)
+# 7) Expose ComfyUI port (for internal use only)
 EXPOSE 8188
 
-# Start sequence
+# 8) Entrypoint
 CMD ["bash", "start.sh"]
