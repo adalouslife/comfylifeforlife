@@ -1,99 +1,107 @@
 #!/usr/bin/env python3
-"""
-install_custom_nodes.py
-Idempotent installer for ComfyUI custom nodes.
+import os, subprocess, sys, time, tempfile, shutil, pathlib
 
-Usage: python3 /workspace/install_custom_nodes.py
+CUSTOM_DIR = "/workspace/ComfyUI/custom_nodes"
+CONSTRAINTS = "/workspace/constraints.txt"
 
-Reads /workspace/custom_nodes.txt (one git url per line, supports comments starting with #)
-Clones each repo into /workspace/ComfyUI/custom_nodes/<repo_name>
-If already present, does a `git -C <dir> pull --ff-only` (best-effort).
-If node repo contains requirements.txt at its root, pip-installs it (best-effort).
-Logs actions to stdout for RunPod logs.
-"""
+REPOS = [
+    # Manager first (some nodes expect it)
+    "https://github.com/ltdrdata/ComfyUI-Manager.git",
+    # Your required set
+    "https://github.com/ltdrdata/ComfyUI-Impact-Pack.git",
+    "https://github.com/Derfuu/ComfyUI-Inpaint-CropAndStitch.git",
+    "https://github.com/kijai/ComfyUI-KJNodes.git",
+    "https://github.com/pythongosssss/ComfyUI-Custom-Scripts.git",
+    "https://github.com/cubiq/ComfyUI_essentials.git",
+    "https://github.com/Acly/comfyui_face_parsing.git",
+    "https://github.com/rgthree/rgthree-comfy.git",
+]
 
-import os
-import subprocess
-import pathlib
-import sys
-from urllib.parse import urlparse
+# Lines in requirements.txt that we do NOT want to install as-is
+# because they tend to force gigantic CUDA upgrades or break torch 2.1.1.
+BLOCK_PATTERNS = (
+    "torch", "torchvision", "torchaudio",
+    "xformers", "triton", "flash-attn",
+    "git+https://github.com/facebookresearch/sam2",
+)
 
-WORKSPACE = os.environ.get("WORKSPACE", "/workspace")
-COMFY_DIR = os.path.join(WORKSPACE, "ComfyUI")
-CUSTOM_DIR = os.path.join(COMFY_DIR, "custom_nodes")
-NODES_LIST = os.path.join(WORKSPACE, "custom_nodes.txt")
+def run(cmd, cwd=None, check=True):
+    print(f"[run] {' '.join(cmd)}  (cwd={cwd})", flush=True)
+    return subprocess.run(cmd, cwd=cwd, check=check)
 
-def safe_run(cmd, cwd=None, check=True):
-    print(f"[run] {' '.join(cmd)}  (cwd={cwd})")
-    try:
-        subprocess.check_call(cmd, cwd=cwd)
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"[error] command failed: {' '.join(cmd)} -> {e}")
-        return False
-    except FileNotFoundError as e:
-        print(f"[error] binary not found: {cmd[0]} -> {e}")
-        return False
+def clone_with_retry(url, dest, tries=3):
+    for i in range(1, tries+1):
+        try:
+            run(["git", "clone", "--depth=1", url, dest])
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"[warn] clone failed ({i}/{tries}) for {url}: {e}", flush=True)
+            time.sleep(3 * i)
+    print(f"[error] clone failed for {url}; skipping", flush=True)
+    return False
 
-def git_repo_name(url):
-    # derive a folder name from the URL
-    # handles urls like https://github.com/user/repo.git or git@github:...
-    path = urlparse(url).path
-    name = os.path.basename(path)
-    if name.endswith(".git"):
-        name = name[:-4]
-    return name or "repo"
+def filtered_requirements_path(req_path: str) -> str:
+    """Write a filtered copy of requirements that removes BLOCK_PATTERNS lines."""
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix="req_", suffix=".txt")
+    os.close(tmp_fd)
+    removed = []
+    with open(req_path, "r", encoding="utf-8", errors="ignore") as fin, \
+         open(tmp_path, "w", encoding="utf-8") as fout:
+        for line in fin:
+            lower = line.strip().lower()
+            if any(b in lower for b in BLOCK_PATTERNS):
+                removed.append(line.strip())
+                continue
+            fout.write(line)
+    if removed:
+        print(f"[info] filtered out from {req_path}:\n  - " + "\n  - ".join(removed), flush=True)
+    return tmp_path
 
-def ensure_dirs():
-    pathlib.Path(CUSTOM_DIR).mkdir(parents=True, exist_ok=True)
-    print(f"[info] custom nodes dir = {CUSTOM_DIR}")
-
-def read_list():
-    if not os.path.exists(NODES_LIST):
-        print(f"[warn] {NODES_LIST} not found — nothing to do")
-        return []
-    with open(NODES_LIST, "r", encoding="utf-8") as f:
-        lines = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
-    return lines
-
-def clone_or_update(url):
-    name = git_repo_name(url)
-    dest = os.path.join(CUSTOM_DIR, name)
-    if os.path.exists(dest):
-        print(f"[info] exists -> trying git pull: {name}")
-        # best-effort pull
-        ok = safe_run(["git", "-C", dest, "pull", "--ff-only"])
-        if not ok:
-            print(f"[warn] git pull failed for {name}; leaving existing copy")
+def pip_install_requirements(req_file: str):
+    # Prefer constraints; if not present, just install normally.
+    if os.path.exists(CONSTRAINTS):
+        print(f"[info] installing with constraints: {CONSTRAINTS}", flush=True)
+        run([sys.executable, "-m", "pip", "install", "-r", req_file, "--constraint", CONSTRAINTS])
     else:
-        print(f"[info] cloning {url} -> {dest}")
-        ok = safe_run(["git", "clone", "--depth=1", url, dest])
-        if not ok:
-            print(f"[error] clone failed for {url}; skipping")
-            return
-    # try to install requirements if present
-    req = os.path.join(dest, "requirements.txt")
-    if os.path.exists(req):
-        print(f"[info] found requirements.txt in {name} -> installing")
-        # use pip from the current python
-        ok = safe_run([sys.executable, "-m", "pip", "install", "-r", req])
-        if not ok:
-            print(f"[warn] pip install failed for {name}; continuing")
-    else:
-        print(f"[info] no requirements.txt for {name}")
+        run([sys.executable, "-m", "pip", "install", "-r", req_file])
 
 def main():
-    ensure_dirs()
-    urls = read_list()
-    if not urls:
-        print("[info] no custom nodes to install (custom_nodes.txt empty or missing)")
-        return
-    for url in urls:
-        try:
-            clone_or_update(url)
-        except Exception as e:
-            print(f"[error] unexpected failure for {url}: {e}")
-    print("[done] custom nodes installation completed")
+    os.makedirs(CUSTOM_DIR, exist_ok=True)
+    print(f"[info] custom nodes dir = {CUSTOM_DIR}")
+
+    for url in REPOS:
+        name = url.split("/")[-1].removesuffix(".git")
+        dest = os.path.join(CUSTOM_DIR, name)
+        if os.path.exists(dest):
+            print(f"[skip] already present: {name}")
+            continue
+
+        print(f"[info] cloning {url} -> {dest}")
+        if not clone_with_retry(url, dest):
+            continue
+
+        req_txt = os.path.join(dest, "requirements.txt")
+        if os.path.isfile(req_txt):
+            print(f"[info] found requirements.txt in {name} -> installing")
+            try:
+                filt = filtered_requirements_path(req_txt)
+                try:
+                    pip_install_requirements(filt)
+                finally:
+                    try:
+                        os.remove(filt)
+                    except Exception:
+                        pass
+            except subprocess.CalledProcessError as e:
+                print(f"[error] pip install failed for {name}; continuing: {e}", flush=True)
+
+    # Safety: re-pin transformers to match torch 2.1.1
+    try:
+        run([sys.executable, "-m", "pip", "install", "transformers<4.45"])
+    except subprocess.CalledProcessError:
+        print("[warn] could not re-pin transformers; continuing", flush=True)
+
+    print("[done] custom nodes installation completed", flush=True)
 
 if __name__ == "__main__":
     main()
