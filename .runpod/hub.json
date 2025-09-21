@@ -1,0 +1,26 @@
+{
+  "title": "ComfyUI Worker (Queue)",
+  "description": "RunPod Serverless worker that runs ComfyUI in-process and accepts queued jobs (URL in, URL out).",
+  "type": "serverless",
+  "category": "image",
+  "iconUrl": "https://raw.githubusercontent.com/comfyanonymous/ComfyUI/master/comfyui.png",
+  "config": {
+    "runsOn": "GPU",
+    "containerDiskInGb": 40,
+    "presets": [
+      {
+        "name": "Default",
+        "defaults": {
+          "COMFY_HOST": "127.0.0.1",
+          "COMFY_PORT": "8188",
+          "STORAGE_DIR": "/runpod-volume"
+        }
+      }
+    ],
+    "env": [
+      { "key": "COMFY_HOST", "value": "127.0.0.1" },
+      { "key": "COMFY_PORT", "value": "8188" },
+      { "key": "STORAGE_DIR", "value": "/runpod-volume" }
+    ]
+  }
+}
