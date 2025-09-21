@@ -1,0 +1,26 @@
+{
+  "title": "ComfyLifeForLife",
+  "description": "ComfyUI on RunPod Serverless with a simple health check for publishing tests.",
+  "type": "serverless",
+  "category": "image",
+  "iconUrl": "https://raw.githubusercontent.com/comfyanonymous/ComfyUI/master/comfyui.png",
+  "config": {
+    "runsOn": "GPU",
+    "containerDiskInGb": 40,
+    "presets": [
+      {
+        "name": "Default",
+        "defaults": {
+          "COMFY_MODE": "production",
+          "OUTPUT_DIR": "/workspace/outputs",
+          "INPUT_DIR": "/workspace/inputs"
+        }
+      }
+    ],
+    "env": [
+      { "key": "COMFY_MODE", "value": "production" },
+      { "key": "OUTPUT_DIR", "value": "/workspace/outputs" },
+      { "key": "INPUT_DIR", "value": "/workspace/inputs" }
+    ]
+  }
+}
