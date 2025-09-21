@@ -1,289 +1,242 @@
 import os
-import io
-import time
 import json
+import time
 import uuid
-import base64
-from typing import Optional, Literal, Dict, Any, List
-
 import httpx
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, HttpUrl
+import requests
+from pathlib import Path
+import runpod
 
-# ----------------------------
-# Configuration (env w/ sane defaults)
-# ----------------------------
+# -------------------------
+# Environment / constants
+# -------------------------
 COMFY_HOST = os.getenv("COMFY_HOST", "127.0.0.1")
 COMFY_PORT = int(os.getenv("COMFY_PORT", "8188"))
 COMFY_BASE = f"http://{COMFY_HOST}:{COMFY_PORT}"
-COMFY_WORKFLOW_PATH = os.getenv(
-    "WORKFLOW_PATH",
-    os.path.join(os.path.dirname(__file__), "comfyui", "workflows", "APIAutoFaceACE.json"),
-)
-COMFY_READY_TIMEOUT = int(os.getenv("COMFY_READY_TIMEOUT", "120"))  # seconds
 
-# Where to stash temp inputs
-TMP_DIR = os.getenv("TMP_DIR", "/tmp")
+WORKFLOW_PATH = os.getenv("WORKFLOW_PATH", "/workspace/comfyui/workflows/APIAutoFaceACE.json")
+INPUT_DIR = Path(os.getenv("INPUT_DIR", "/workspace/inputs"))
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "/workspace/outputs"))
+UPLOAD_PROVIDER = os.getenv("UPLOAD_PROVIDER", "catbox")  # catbox | none
 
-# Upload provider (we'll default to Catbox which requires no API key)
-UPLOAD_PROVIDER = os.getenv("UPLOAD_PROVIDER", "catbox")  # only 'catbox' supported here
+INPUT_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ----------------------------
-# FastAPI app
-# ----------------------------
-app = FastAPI(title="comfylifeforlife serverless handler", version="1.0.0")
+HTTP_TIMEOUT = 60
+POLL_TIMEOUT = 300
+POLL_INTERVAL = 1.0
 
-# ----------------------------
-# Models
-# ----------------------------
-class HealthPayload(BaseModel):
-    op: Literal["health_check"] = "health_check"
-
-class SwapFacesPayload(BaseModel):
-    op: Literal["swap_faces"] = "swap_faces"
-    # Provide either URLs or base64s; we will only use URLs in production as requested,
-    # but keep base64 support for flexibility.
-    source_url: Optional[HttpUrl] = None
-    target_url: Optional[HttpUrl] = None
-    source_b64: Optional[str] = None
-    target_b64: Optional[str] = None
-    # Optional runtime tweakables
-    workflow_path: Optional[str] = None
-    timeout: Optional[int] = 600  # seconds
-
-class RunPayload(BaseModel):
-    # Generic wrapper – op decides which payload we validate at runtime
-    op: Literal["health_check", "swap_faces"] = "health_check"
-    source_url: Optional[HttpUrl] = None
-    target_url: Optional[HttpUrl] = None
-    source_b64: Optional[str] = None
-    target_b64: Optional[str] = None
-    workflow_path: Optional[str] = None
-    timeout: Optional[int] = 600
-
-# ----------------------------
-# Utilities
-# ----------------------------
-def _now_ms() -> int:
-    return int(time.time() * 1000)
-
-def _ensure_dir(p: str):
-    os.makedirs(p, exist_ok=True)
-
-async def comfy_ready() -> bool:
-    """Poll ComfyUI until ready or timeout."""
-    deadline = time.time() + COMFY_READY_TIMEOUT
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        while time.time() < deadline:
-            try:
-                # Any of these should work; '/queue' is quite cheap.
-                r = await client.get(f"{COMFY_BASE}/queue")
-                if r.status_code == 200:
-                    return True
-            except Exception:
-                pass
-            await _sleep(0.5)
+# -------------------------
+# Helpers
+# -------------------------
+def wait_for_comfyui(timeout=POLL_TIMEOUT):
+    """Wait until ComfyUI HTTP API is reachable."""
+    deadline = time.time() + timeout
+    url = f"{COMFY_BASE}/queue/status"
+    while time.time() < deadline:
+        try:
+            r = httpx.get(url, timeout=5)
+            if r.status_code == 200:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
     return False
 
-async def _sleep(sec: float):
-    # tiny helper to keep all awaits in one place
-    await httpx.AsyncClient().aclose()  # no-op to keep linter calm
-    time.sleep(sec)
 
-async def _download_image_to_tmp(url: str, name: str) -> str:
-    _ensure_dir(TMP_DIR)
-    out_path = os.path.join(TMP_DIR, name)
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        r = await client.get(url)
+def download_to(path: Path, url: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with requests.get(url, stream=True, timeout=HTTP_TIMEOUT) as r:
         r.raise_for_status()
-        with open(out_path, "wb") as f:
-            f.write(r.content)
-    return out_path
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1 << 20):
+                if chunk:
+                    f.write(chunk)
+    return path
 
-async def _write_b64_to_tmp(b64_data: str, name: str) -> str:
-    _ensure_dir(TMP_DIR)
-    out_path = os.path.join(TMP_DIR, name)
-    raw = base64.b64decode(b64_data.split(",")[-1])
-    with open(out_path, "wb") as f:
-        f.write(raw)
-    return out_path
 
-async def _comfy_upload_local_image(path: str) -> str:
-    """Upload a local file to ComfyUI /upload/image so it appears under 'input/'."""
-    filename = os.path.basename(path)
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        with open(path, "rb") as fp:
-            files = {"image": (filename, fp, "application/octet-stream")}
-            r = await client.post(f"{COMFY_BASE}/upload/image", files=files)
-            r.raise_for_status()
-    return filename  # Comfy saves under input/{filename}
-
-def _load_workflow(path: str) -> Dict[str, Any]:
+def load_workflow(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def _patch_workflow_images(workflow: Dict[str, Any], source_input_name: str, target_input_name: str) -> Dict[str, Any]:
+
+def guess_and_inject_images(prompt: dict, source_path: str, target_path: str) -> dict:
     """
-    Patch workflow so that two 'LoadImage' (or compatible) nodes use the uploaded filenames.
-    Strategy:
-    - Prefer nodes that already have an 'image' param.
-    - If there are >2 such nodes, take the first two.
-    - We assume your workflow expects two inputs: source and target.
+    Try to inject the downloaded file paths into the first two image-accepting nodes.
+    This is generic and works for most workflows that use 'LoadImage' or
+    accept 'image'/'filename'/'path' style inputs.
     """
-    nodes = workflow
-    image_nodes = []
-    for node_id, node in nodes.items():
+    set_count = 0
+    for node_id, node in prompt.items():
         inputs = node.get("inputs", {})
-        class_type = node.get("class_type", "")
-        if "image" in inputs or class_type.lower().startswith("loadimage"):
-            image_nodes.append((node_id, node))
+        # Keys that often represent local image paths in ComfyUI nodes:
+        for key in ["image", "filename", "path", "file", "input_image"]:
+            if key in inputs and isinstance(inputs[key], str):
+                if set_count == 0:
+                    inputs[key] = source_path
+                    set_count += 1
+                elif set_count == 1:
+                    inputs[key] = target_path
+                    set_count += 1
+                    return prompt
+        # Some nodes hide filenames under dicts
+        for key, val in list(inputs.items()):
+            if isinstance(val, dict):
+                for k2 in ["image", "filename", "path", "file", "input_image"]:
+                    if k2 in val and isinstance(val[k2], str):
+                        if set_count == 0:
+                            val[k2] = source_path
+                            set_count += 1
+                        elif set_count == 1:
+                            val[k2] = target_path
+                            set_count += 1
+                            return prompt
+    return prompt
 
-    if len(image_nodes) < 2:
-        # Be explicit so we know what broke if the workflow changes
-        raise HTTPException(status_code=422, detail="Workflow must contain at least two image input nodes.")
 
-    # Patch the first two we find: [0] -> source, [1] -> target
-    image_nodes[0][1].setdefault("inputs", {})["image"] = source_input_name
-    image_nodes[1][1].setdefault("inputs", {})["image"] = target_input_name
-    return nodes
+def post_prompt(prompt: dict) -> str:
+    url = f"{COMFY_BASE}/prompt"
+    r = httpx.post(url, json={"prompt": prompt}, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    return data.get("prompt_id")
 
-async def _comfy_submit_prompt(prompt_json: Dict[str, Any]) -> str:
-    """POST /prompt and return prompt_id."""
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        r = await client.post(f"{COMFY_BASE}/prompt", json={"prompt": prompt_json, "client_id": str(uuid.uuid4())})
-        r.raise_for_status()
-        data = r.json()
-        return data.get("prompt_id") or data.get("promptId") or data.get("id") or ""
 
-async def _comfy_wait_for_images(prompt_id: str, timeout: int = 600) -> List[Dict[str, Any]]:
-    """
-    Poll /history/{prompt_id} until images appear.
-    Returns the list of produced images (each item has filename, type, subfolder).
-    """
+def fetch_history(prompt_id: str) -> dict | None:
+    url = f"{COMFY_BASE}/history/{prompt_id}"
+    try:
+        r = httpx.get(url, timeout=HTTP_TIMEOUT)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+
+def wait_for_images(prompt_id: str, timeout=POLL_TIMEOUT) -> list[dict]:
     deadline = time.time() + timeout
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        while time.time() < deadline:
-            r = await client.get(f"{COMFY_BASE}/history/{prompt_id}")
-            if r.status_code == 200:
-                hist = r.json()
-                # Structure: { "<prompt_id>": { "outputs": { "<node_id>": { "images": [ ... ] } } } }
-                entry = hist.get(prompt_id) or {}
-                outputs = entry.get("outputs") or {}
-                imgs: List[Dict[str, Any]] = []
-                for _node_id, info in outputs.items():
-                    for im in info.get("images", []) or []:
-                        imgs.append(im)
-                if imgs:
-                    return imgs
-            await _sleep(0.5)
-    raise HTTPException(status_code=504, detail="Timed out waiting for Comfy output.")
+    while time.time() < deadline:
+        h = fetch_history(prompt_id)
+        # Expected structure: { prompt_id: { "outputs": { node_id: { "images": [{filename, subfolder, type}, ...] } } } }
+        if h and prompt_id in h:
+            outputs = h[prompt_id].get("outputs", {})
+            images = []
+            for _nid, out in outputs.items():
+                for img in out.get("images", []):
+                    images.append(img)
+            if images:
+                return images
+        time.sleep(POLL_INTERVAL)
+    raise TimeoutError("Timed out waiting for ComfyUI images.")
 
-async def _comfy_fetch_image_bytes(image_meta: Dict[str, Any]) -> bytes:
+
+def pull_image_bytes_from_comfy(img_meta: dict) -> bytes:
+    # img_meta example: {"filename":"something.png","subfolder":"","type":"output"}
+    params = {
+        "filename": img_meta["filename"],
+        "subfolder": img_meta.get("subfolder", ""),
+        "type": img_meta.get("type", "output"),
+    }
+    url = f"{COMFY_BASE}/view"
+    r = httpx.get(url, params=params, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    return r.content
+
+
+def save_bytes_to_output(content: bytes, suffix=".png") -> Path:
+    out_path = OUTPUT_DIR / f"{uuid.uuid4().hex}{suffix}"
+    with open(out_path, "wb") as f:
+        f.write(content)
+    return out_path
+
+
+def upload_to_catbox(file_path: Path) -> str:
     """
-    Download one output image from ComfyUI's /view endpoint.
+    Anonymous upload to catbox.moe (simple and reliable).
+    Returns a public URL.
     """
-    filename = image_meta["filename"]
-    subfolder = image_meta.get("subfolder", "")
-    img_type = image_meta.get("type", "output")
+    with open(file_path, "rb") as f:
+        resp = requests.post(
+            "https://catbox.moe/user/api.php",
+            data={"reqtype": "fileupload"},
+            files={"fileToUpload": (file_path.name, f)},
+            timeout=HTTP_TIMEOUT,
+        )
+    resp.raise_for_status()
+    url = resp.text.strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise RuntimeError(f"Unexpected catbox response: {url}")
+    return url
 
-    params = {"filename": filename, "type": img_type}
-    if subfolder:
-        params["subfolder"] = subfolder
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        r = await client.get(f"{COMFY_BASE}/view", params=params)
-        r.raise_for_status()
-        return r.content
-
-async def _upload_bytes_to_catbox(image_bytes: bytes, filename: str = "output.png") -> str:
+# -------------------------
+# RunPod Job Handler
+# -------------------------
+def job_handler(event):
     """
-    Uploads bytes to Catbox, returns public URL.
-    Doc: https://catbox.moe/tools.php (user API)
+    event format:
+    {
+      "input": {
+        "op": "health_check" | "faceswap",
+        "source_url": "https://...",
+        "target_url": "https://...",
+        "workflow_path": "/workspace/comfyui/workflows/APIAutoFaceACE.json" (optional)
+      }
+    }
     """
-    files = {"fileToUpload": (filename, io.BytesIO(image_bytes), "application/octet-stream")}
-    data = {"reqtype": "fileupload"}
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        r = await client.post("https://catbox.moe/user/api.php", data=data, files=files)
-        r.raise_for_status()
-        url = r.text.strip()
-        if not url.startswith("http"):
-            raise HTTPException(status_code=502, detail=f"Catbox returned unexpected response: {url}")
-        return url
+    inp = (event or {}).get("input") or {}
+    op = (inp.get("op") or "health_check").lower()
 
-# ----------------------------
-# Routes
-# ----------------------------
-@app.get("/healthz")
-async def healthz():
-    # No Comfy check required; super-fast readiness for the platform.
-    return {"status": "ok", "ts": _now_ms()}
+    # Ensure ComfyUI is reachable for any op
+    if not wait_for_comfyui():
+        return {"ok": False, "error": "ComfyUI API not reachable on 127.0.0.1:8188"}
 
-@app.post("/run")
-async def run(payload: RunPayload):
-    """
-    RunPod Serverless entrypoint.
-    Supports:
-    - {"op":"health_check"}
-    - {"op":"swap_faces", "source_url":"...", "target_url":"..."}  (URLs only, as requested)
-    """
-    # Always allow health check with no extra inputs.
-    if payload.op == "health_check":
-        return {"status": "ok", "ts": _now_ms()}
+    if op == "health_check":
+        # Light ping using /queue/status
+        r = httpx.get(f"{COMFY_BASE}/queue/status", timeout=HTTP_TIMEOUT)
+        return {"ok": True, "comfyui": r.json() if r.status_code == 200 else {"status": r.status_code}}
 
-    # From here, we need Comfy up.
-    if not await comfy_ready():
-        raise HTTPException(status_code=503, detail="ComfyUI not ready.")
+    if op == "faceswap":
+        source_url = inp.get("source_url")
+        target_url = inp.get("target_url")
+        if not source_url or not target_url:
+            return {"ok": False, "error": "Provide 'source_url' and 'target_url'."}
 
-    # Validate swap inputs
-    if payload.op == "swap_faces":
-        # Prefer URLs; allow b64 fallback if needed.
-        if not ((payload.source_url and payload.target_url) or (payload.source_b64 and payload.target_b64)):
-            raise HTTPException(status_code=400, detail="Provide 'source_url' & 'target_url' (or 'source_b64' & 'target_b64').")
+        sid = uuid.uuid4().hex[:8]
+        spath = str(download_to(INPUT_DIR / f"source_{sid}.img", source_url))
+        tpath = str(download_to(INPUT_DIR / f"target_{sid}.img", target_url))
 
-        # Resolve workflow path
-        wf_path = payload.workflow_path or COMFY_WORKFLOW_PATH
-        if not os.path.isfile(wf_path):
-            raise HTTPException(status_code=500, detail=f"Workflow not found at {wf_path}")
+        wf_path = inp.get("workflow_path", WORKFLOW_PATH)
+        prompt = load_workflow(wf_path)
+        prompt = guess_and_inject_images(prompt, spath, tpath)
 
-        # Prepare inputs
-        if payload.source_url and payload.target_url:
-            src_local = await _download_image_to_tmp(str(payload.source_url), f"src_{uuid.uuid4().hex}.png")
-            tgt_local = await _download_image_to_tmp(str(payload.target_url), f"tgt_{uuid.uuid4().hex}.png")
-        else:
-            src_local = await _write_b64_to_tmp(payload.source_b64, f"src_{uuid.uuid4().hex}.png")
-            tgt_local = await _write_b64_to_tmp(payload.target_b64, f"tgt_{uuid.uuid4().hex}.png")
+        prompt_id = post_prompt(prompt)
+        images = wait_for_images(prompt_id)
 
-        # Upload into Comfy's input/ so 'LoadImage' nodes can see them
-        src_name = await _comfy_upload_local_image(src_local)  # e.g. "src_xxx.png"
-        tgt_name = await _comfy_upload_local_image(tgt_local)  # e.g. "tgt_xxx.png"
+        # Take the last produced image by default
+        last_img = images[-1]
+        img_bytes = pull_image_bytes_from_comfy(last_img)
+        # Guess suffix from filename
+        suffix = Path(last_img.get("filename", "")).suffix or ".png"
+        out_path = save_bytes_to_output(img_bytes, suffix=suffix)
 
-        # Load and patch the workflow
-        workflow = _load_workflow(wf_path)
-        prompt_json = _patch_workflow_images(workflow, source_input_name=src_name, target_input_name=tgt_name)
-
-        # Submit prompt and wait for images
-        prompt_id = await _comfy_submit_prompt(prompt_json)
-        images = await _comfy_wait_for_images(prompt_id, timeout=payload.timeout or 600)
-
-        # Take the first image
-        out_bytes = await _comfy_fetch_image_bytes(images[0])
-
-        # Upload to Catbox (returns a public URL)
+        result_url = None
         if UPLOAD_PROVIDER == "catbox":
-            public_url = await _upload_bytes_to_catbox(out_bytes, filename="faceswap.png")
+            result_url = upload_to_catbox(out_path)
         else:
-            # Fallback to data URL if someone disables catbox
-            b64 = base64.b64encode(out_bytes).decode("utf-8")
-            public_url = f"data:image/png;base64,{b64}"
+            # If you don't want to upload anywhere, return the container path
+            result_url = f"file://{out_path}"
 
         return {
-            "status": "ok",
-            "output_url": public_url,
-            "debug": {
-                "prompt_id": prompt_id,
-                "comfy_base": COMFY_BASE,
-            }
+            "ok": True,
+            "result_url": result_url,
+            "output_path": str(out_path),
+            "images_meta": images
         }
 
     # Unknown op
-    raise HTTPException(status_code=400, detail=f"Unknown op '{payload.op}'")
+    return {"ok": False, "error": f"Unknown op '{op}'."}
+
+
+# Start the RunPod serverless worker (polls the queue)
+runpod.serverless.start({"handler": job_handler})
