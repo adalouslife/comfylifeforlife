@@ -1,58 +1,91 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ---- config ----
-COMFY_ROOT="${COMFY_ROOT:-/workspace/ComfyUI}"
-COMFY_APP="${COMFY_APP:-${COMFY_ROOT}}"
-COMFY_PORT="${COMFY_PORT:-8188}"
-HANDLER_PORT="${HANDLER_PORT:-8000}"
-WAIT_SECONDS="${WAIT_SECONDS:-120}"
+export PYTHONUNBUFFERED=1
 
-echo "[start] COMFY_ROOT=${COMFY_ROOT}"
-echo "[start] COMFY_APP=${COMFY_APP}"
-echo "[start] COMFY_PORT=${COMFY_PORT}  HANDLER_PORT=${HANDLER_PORT}"
+# ----------------------------
+# Core ports (same as before)
+# ----------------------------
+export COMFY_HOST="${COMFY_HOST:-127.0.0.1}"
+export COMFY_PORT="${COMFY_PORT:-8188}"
+export RP_HANDLER_PORT="${RP_HANDLER_PORT:-8000}"
 
-# If COMFY_APP doesn’t have main.py (e.g., COMFY_ROOT points to /runpod-volume/ComfyUI),
-# seed it from the baked-in /workspace/ComfyUI.
-if [ ! -f "${COMFY_APP}/main.py" ]; then
-  echo "[start] Seeding ComfyUI into ${COMFY_APP} ..."
-  mkdir -p "$(dirname "${COMFY_APP}")"
-  rm -rf "${COMFY_APP}" || true
-  cp -r /workspace/ComfyUI "${COMFY_APP}"
-fi
+# ----------------------------
+# Optional storage wiring
+# ----------------------------
+# If you attached a Network Volume, RunPod typically mounts it at /runpod-volume.
+# We'll support either:
+#   - STORAGE_DIR env var (recommended to set to /runpod-volume), OR
+#   - auto-detect /runpod-volume if it exists.
+#
+# We will symlink ComfyUI's models/ and output/ into the storage so assets persist.
+# If the storage is missing, we do nothing (no breakage).
+COMFY_ROOT="/workspace/ComfyUI"
+MODELS_DIR="${COMFY_ROOT}/models"
+OUTPUT_DIR="${COMFY_ROOT}/output"
 
-# Ensure ComfyUI input/output exist
-mkdir -p "${COMFY_APP}/input" "${COMFY_APP}/output" /workspace/logs
-
-# ---- start ComfyUI ----
-echo "[start] Launching ComfyUI..."
-python3 -u "${COMFY_APP}/main.py" \
-  --listen 0.0.0.0 --port "${COMFY_PORT}" \
-  --disable-auto-launch \
-  > /workspace/logs/comfyui.log 2>&1 &
-
-COMFY_PID=$!
-
-# Wait for ComfyUI health
-echo "[start] Waiting for ComfyUI to be ready..."
-ready=0
-for i in $(seq 1 "${WAIT_SECONDS}"); do
-  if curl -fsS "http://127.0.0.1:${COMFY_PORT}/system_stats" >/dev/null 2>&1; then
-    ready=1
-    break
+# Choose a storage root, prefer env if provided
+CANDIDATE_STORAGE="${STORAGE_DIR:-}"
+if [[ -z "${CANDIDATE_STORAGE}" ]]; then
+  if [[ -d "/runpod-volume" ]]; then
+    CANDIDATE_STORAGE="/runpod-volume"
   fi
-  sleep 1
-done
-
-if [ "${ready}" -ne 1 ]; then
-  echo "[start][ERROR] ComfyUI did not become ready in ${WAIT_SECONDS}s"
-  echo "---- ComfyUI log tail ----"
-  tail -n 200 /workspace/logs/comfyui.log || true
-  exit 1
 fi
 
-echo "[start] ComfyUI is up."
+if [[ -n "${CANDIDATE_STORAGE}" && -d "${CANDIDATE_STORAGE}" && -w "${CANDIDATE_STORAGE}" ]]; then
+  echo "[start.sh] Using storage at: ${CANDIDATE_STORAGE}"
 
-# ---- start FastAPI handler (serves RunPod serverless requests) ----
-echo "[start] Launching API handler..."
-python3 -u /workspace/handler.py
+  # Create comfy folders in storage
+  mkdir -p "${CANDIDATE_STORAGE}/comfyui-models"
+  mkdir -p "${CANDIDATE_STORAGE}/comfyui-output"
+
+  # Ensure Comfy root exists
+  mkdir -p "${COMFY_ROOT}"
+
+  # If Comfy has real dirs already, and not symlinks, keep them but prefer storage via symlink
+  # Move any non-empty existing output to storage once (best-effort; ignore errors)
+  if [[ -d "${OUTPUT_DIR}" && ! -L "${OUTPUT_DIR}" ]]; then
+    shopt -s nullglob dotglob
+    if compgen -G "${OUTPUT_DIR}/*" > /dev/null; then
+      echo "[start.sh] Moving existing output/ contents to storage..."
+      mv "${OUTPUT_DIR}/"* "${CANDIDATE_STORAGE}/comfyui-output/" || true
+    fi
+    rm -rf "${OUTPUT_DIR}"
+  fi
+
+  # DO NOT move models automatically (users often mount their own); just wire the path.
+  if [[ -d "${MODELS_DIR}" && ! -L "${MODELS_DIR}" ]]; then
+    # leave any existing files in place; if user wants them persisted they can copy later
+    :
+  fi
+
+  # Create symlinks (idempotent)
+  if [[ ! -e "${OUTPUT_DIR}" ]]; then
+    ln -s "${CANDIDATE_STORAGE}/comfyui-output" "${OUTPUT_DIR}"
+  fi
+
+  if [[ ! -e "${MODELS_DIR}" && -d "${CANDIDATE_STORAGE}/comfyui-models" ]]; then
+    ln -s "${CANDIDATE_STORAGE}/comfyui-models" "${MODELS_DIR}"
+  fi
+
+  echo "[start.sh] Symlinks set:"
+  ls -l "${MODELS_DIR}" || true
+  ls -l "${OUTPUT_DIR}" || true
+else
+  echo "[start.sh] No writable storage detected (STORAGE_DIR unset and /runpod-volume not present). Skipping wiring."
+fi
+
+# ----------------------------
+# Start ComfyUI (headless)
+# ----------------------------
+echo "[start.sh] Launching ComfyUI on ${COMFY_HOST}:${COMFY_PORT} ..."
+python -u /workspace/ComfyUI/main.py --listen 0.0.0.0 --port "${COMFY_PORT}" --disable-auto-open-browser >/tmp/comfy.log 2>&1 &
+
+# Small delay to reduce races
+sleep 2
+
+# ----------------------------
+# Start FastAPI handler
+# ----------------------------
+echo "[start.sh] Launching FastAPI handler on 0.0.0.0:${RP_HANDLER_PORT} ..."
+uvicorn handler:app --host 0.0.0.0 --port "${RP_HANDLER_PORT}"
