@@ -1,43 +1,58 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-COMFY_HOST="${COMFY_HOST:-127.0.0.1}"
+# ---- config ----
+COMFY_ROOT="${COMFY_ROOT:-/workspace/ComfyUI}"
+COMFY_APP="${COMFY_APP:-${COMFY_ROOT}}"
 COMFY_PORT="${COMFY_PORT:-8188}"
-COMFY_BIND="${COMFY_BIND:-0.0.0.0}"
-WORK_DIR="${WORK_DIR:-/workspace}"
-COMFY_ROOT="${COMFY_ROOT:-/workspace/comfylifeforlife/comfyui}"
-COMFY_APP="${COMFY_APP:-${COMFY_ROOT}/ComfyUI}"   # if you vendor ComfyUI under comfyui/ComfyUI
+HANDLER_PORT="${HANDLER_PORT:-8000}"
+WAIT_SECONDS="${WAIT_SECONDS:-120}"
 
-mkdir -p "${WORK_DIR}/logs"
-LOG="${WORK_DIR}/logs/comfyui.log"
+echo "[start] COMFY_ROOT=${COMFY_ROOT}"
+echo "[start] COMFY_APP=${COMFY_APP}"
+echo "[start] COMFY_PORT=${COMFY_PORT}  HANDLER_PORT=${HANDLER_PORT}"
 
-echo "Launching ComfyUI from: ${COMFY_APP}"
-python -u "${COMFY_APP}/main.py" \
-  --listen "${COMFY_BIND}" \
-  --port "${COMFY_PORT}" \
+# If COMFY_APP doesn’t have main.py (e.g., COMFY_ROOT points to /runpod-volume/ComfyUI),
+# seed it from the baked-in /workspace/ComfyUI.
+if [ ! -f "${COMFY_APP}/main.py" ]; then
+  echo "[start] Seeding ComfyUI into ${COMFY_APP} ..."
+  mkdir -p "$(dirname "${COMFY_APP}")"
+  rm -rf "${COMFY_APP}" || true
+  cp -r /workspace/ComfyUI "${COMFY_APP}"
+fi
+
+# Ensure ComfyUI input/output exist
+mkdir -p "${COMFY_APP}/input" "${COMFY_APP}/output" /workspace/logs
+
+# ---- start ComfyUI ----
+echo "[start] Launching ComfyUI..."
+python3 -u "${COMFY_APP}/main.py" \
+  --listen 0.0.0.0 --port "${COMFY_PORT}" \
   --disable-auto-launch \
-  --dont-print-server \
-  > "${LOG}" 2>&1 &
+  > /workspace/logs/comfyui.log 2>&1 &
 
 COMFY_PID=$!
 
-echo "Waiting for ComfyUI on ${COMFY_HOST}:${COMFY_PORT} ..."
-for i in {1..120}; do
-  if curl -sf "http://${COMFY_HOST}:${COMFY_PORT}/system_stats" >/dev/null; then
-    echo "ComfyUI is up."
+# Wait for ComfyUI health
+echo "[start] Waiting for ComfyUI to be ready..."
+ready=0
+for i in $(seq 1 "${WAIT_SECONDS}"); do
+  if curl -fsS "http://127.0.0.1:${COMFY_PORT}/system_stats" >/dev/null 2>&1; then
+    ready=1
     break
   fi
   sleep 1
-  if ! kill -0 ${COMFY_PID} 2>/dev/null; then
-    echo "ComfyUI crashed. Last log lines:"
-    tail -n 200 "${LOG}" || true
-    exit 1
-  fi
-  if [ "$i" -eq 120 ]; then
-    echo "Timed out waiting for ComfyUI."
-    exit 1
-  fi
 done
 
-echo "Starting handler..."
-python -u /workspace/handler.py
+if [ "${ready}" -ne 1 ]; then
+  echo "[start][ERROR] ComfyUI did not become ready in ${WAIT_SECONDS}s"
+  echo "---- ComfyUI log tail ----"
+  tail -n 200 /workspace/logs/comfyui.log || true
+  exit 1
+fi
+
+echo "[start] ComfyUI is up."
+
+# ---- start FastAPI handler (serves RunPod serverless requests) ----
+echo "[start] Launching API handler..."
+python3 -u /workspace/handler.py
