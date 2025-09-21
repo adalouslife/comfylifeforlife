@@ -1,0 +1,10 @@
+{
+  "timeout": 30,
+  "tests": [
+    {
+      "name": "self",
+      "input": { "self_test": true },
+      "expected": { "ok": true }
+    }
+  ]
+}
