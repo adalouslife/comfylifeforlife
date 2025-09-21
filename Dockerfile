@@ -1,46 +1,58 @@
-# --------------------------------------------
-# ComfyUI RunPod Serverless Worker (FaceSwap)
-# --------------------------------------------
+# ---- Base: CUDA 12.1 + cuDNN on Ubuntu 22.04 ----
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
-# 1) Base image with CUDA + Python (matches RunPod GPU environment)
-FROM runpod/base:0.4.0-cuda12.1.105
-
-# 2) Environment setup
+# Noninteractive apt
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    WORKSPACE=/workspace \
-    COMFYUI_ROOT=/workspace/ComfyUI \
-    COMFYUI_INPUT_DIR=/workspace/ComfyUI/input \
-    COMFYUI_OUTPUT_DIR=/workspace/ComfyUI/output \
-    COMFYUI_MODELS_PATH=/workspace/ComfyUI/models \
-    WORKFLOW_FILE=/app/workflows/faceswap_api.json
+    WORKSPACE=/workspace
 
 WORKDIR $WORKSPACE
 
-# 3) Install system deps
-RUN apt-get update && apt-get install -y \
-    git wget curl zip \
- && rm -rf /var/lib/apt/lists/*
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 python3-pip python3.10-venv \
+    git wget curl zip ca-certificates \
+    libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python \
+    && ln -sf /usr/bin/pip3 /usr/bin/pip
 
-# 4) Install ComfyUI
+# ComfyUI
 RUN git clone https://github.com/comfyanonymous/ComfyUI.git ComfyUI
 
-# 5) Install Python deps
-RUN pip install --upgrade pip setuptools wheel \
- && pip install -r ComfyUI/requirements.txt \
- && pip install runpod requests
+# Make sure we have a modern pip
+RUN python -m pip install --upgrade pip setuptools wheel
 
-# 6) Copy repo files
-# (Assumes your repo has handler.py, start.sh, workflows/, etc.)
-COPY . /app
-WORKDIR /app
+# Install PyTorch w/ CUDA 12.1 wheels (aligned with the base image)
+RUN pip install --index-url https://download.pytorch.org/whl/cu121 \
+    torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1
 
-# Ensure shell scripts are executable
-RUN chmod +x /app/*.sh
+# ComfyUI requirements (will reuse the already installed torch)
+RUN pip install -r ComfyUI/requirements.txt
 
-# 7) Expose ComfyUI port (for internal use only)
+# Serverless + API bits
+RUN pip install runpod fastapi uvicorn requests
+
+# Copy your repo (handler.py, start.sh, comfyui/workflows, etc.)
+COPY . $WORKSPACE
+
+# Ensure scripts are executable
+RUN chmod +x $WORKSPACE/*.sh || true
+
+# Defaults that make local + serverless runs smooth; override in RunPod env if needed
+ENV COMFY_ROOT=/workspace/ComfyUI \
+    WORKFLOW_PATH=/workspace/comfylifeforlife/comfyui/workflows/APIAutoFaceACE.json \
+    OUTPUT_DIR=/workspace/output \
+    TMP_DIR=/workspace/tmp \
+    COMFY_PORT=8188 \
+    HANDLER_PORT=8000
+
+# Create output dirs so writing won't fail
+RUN mkdir -p "$OUTPUT_DIR" "$TMP_DIR"
+
 EXPOSE 8188
+EXPOSE 8000
 
-# 8) Entrypoint
+# Start ComfyUI then the serverless handler
 CMD ["bash", "start.sh"]
