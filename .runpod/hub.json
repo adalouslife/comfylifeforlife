@@ -2,7 +2,7 @@
 
 {
   "title": "My ComfyUI Worker Bastard",
-  "description": "ComfyUI running on RunPod Serverless with support for custom nodes, LoRAs, UNETs, VAEs, and automatic workflows. Handles image inputs/outputs via API for face swap and related tasks.",
+  "description": "ComfyUI running on RunPod Serverless with support for custom nodes, LoRAs, UNETs, VAEs, and automatic workflows.",
   "type": "serverless",
   "category": "image",
   "iconUrl": "https://raw.githubusercontent.com/comfyanonymous/ComfyUI/master/comfyui.png",
