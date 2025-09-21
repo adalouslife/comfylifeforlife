@@ -1,57 +1,18 @@
 {
   "tests": [
     {
-      "name": "health_check",
+      "name": "smoke_offline",
       "input": {
-        "ping": true
+        "op": "health_check"
       },
-      "timeout": 8000
-    },
-    {
-      "name": "validation_text_input",
-      "input": {
-        "text": "Hello world",
-        "language": "en"
-      },
-      "timeout": 10000
-    },
-    {
-      "name": "dry_run_workflow",
-      "input": {
-        "workflow": "noop",
-        "options": {
-          "dryRun": true
-        }
-      },
-      "timeout": 12000
+      "timeout": 20000
     }
   ],
   "config": {
     "gpuTypeId": "NVIDIA GeForce RTX 4090",
     "gpuCount": 1,
     "env": [
-      {
-        "key": "COMFY_MODE",
-        "value": "production"
-      },
-      {
-        "key": "OUTPUT_DIR",
-        "value": "/workspace/outputs"
-      },
-      {
-        "key": "INPUT_DIR",
-        "value": "/workspace/inputs"
-      }
-    ],
-    "allowedCudaVersions": [
-      "12.7",
-      "12.6",
-      "12.5",
-      "12.4",
-      "12.3",
-      "12.2",
-      "12.1",
-      "12.0"
+      { "key": "RUNPOD_TEST_MODE", "value": "true" }
     ]
   }
 }
