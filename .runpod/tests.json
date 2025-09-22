@@ -1,0 +1,17 @@
+{
+  "tests": [
+    {
+      "name": "smoke_health",
+      "input": { "op": "health_check" },
+      "timeout": 10000
+    }
+  ],
+  "config": {
+    "gpuTypeId": "NVIDIA GeForce RTX 4090",
+    "gpuCount": 1,
+    "env": [
+      { "key": "RUNPOD_TEST_MODE", "value": "true" }
+    ],
+    "allowedCudaVersions": ["12.6", "12.5", "12.4", "12.3", "12.2", "12.1", "12.0"]
+  }
+}
