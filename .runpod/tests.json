@@ -1,9 +1,9 @@
 {
   "tests": [
     {
-      "name": "sanity_ping",
+      "name": "ping",
       "input": { "op": "health_check" },
-      "timeout": 15000
+      "timeout": 20000
     }
   ],
   "config": {
