@@ -1,89 +1,159 @@
 import os
-import base64
+import io
 import time
 import json
-import urllib.request
+import uuid
+import base64
+import runpod
+import shutil
+import requests
 from typing import Dict, Any
 
-import runpod
+COMFY_HOST = os.getenv("COMFY_HOST", "127.0.0.1")
+COMFY_PORT = int(os.getenv("COMFY_PORT", "8188"))
+COMFY_URL  = f"http://{COMFY_HOST}:{COMFY_PORT}"
 
-COMFY_HOST = os.getenv("COMFY_BIND_HOST", "127.0.0.1")
-COMFY_PORT = int(os.getenv("COMFY_BIND_PORT", "8188"))
-COMFY_URL = f"http://{COMFY_HOST}:{COMFY_PORT}"
+INPUT_DIR  = os.getenv("INPUT_DIR", "/workspace/ComfyUI/input")
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/workspace/ComfyUI/output")
 
-def _ping(url: str, timeout: float = 1.5) -> bool:
+# -------- Utilities --------
+
+def _ok() -> bool:
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
-            r.read()
-        return True
+        r = requests.get(f"{COMFY_URL}/system_stats", timeout=5)
+        return r.ok
     except Exception:
         return False
 
-def _ensure_comfy_ready(max_wait_s: int = 30) -> bool:
-    """Light readiness gate used by ops that need Comfy."""
-    for _ in range(max_wait_s):
-        if _ping(f"{COMFY_URL}/system_stats"):
-            return True
-        time.sleep(1)
-    return False
+def _download(url: str, dest_path: str) -> str:
+    r = requests.get(url, timeout=30, stream=True)
+    r.raise_for_status()
+    with open(dest_path, "wb") as f:
+        for chunk in r.iter_content(1024 * 1024):
+            if chunk:
+                f.write(chunk)
+    return dest_path
 
-def _download_to_b64(u: str) -> str:
-    with urllib.request.urlopen(u, timeout=15) as r:
-        data = r.read()
-    return base64.b64encode(data).decode("utf-8")
+def _save_b64(b64: str, dest_path: str) -> str:
+    with open(dest_path, "wb") as f:
+        f.write(base64.b64decode(b64))
+    return dest_path
 
-def _ok(**kw) -> Dict[str, Any]:
-    o = {"ok": True}
-    o.update(kw)
-    return o
+def _ensure_dirs():
+    os.makedirs(INPUT_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-def _fail(msg: str, **kw) -> Dict[str, Any]:
-    o = {"ok": False, "error": msg}
-    o.update(kw)
-    return o
+def _comfy_prompt(prompt: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Sends a prompt to ComfyUI /prompt and waits for output filenames
+    saved by the SaveImage node(s).
+    """
+    # queue the prompt
+    resp = requests.post(f"{COMFY_URL}/prompt", json={"prompt": prompt}, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    prompt_id = data.get("prompt_id")
+    if not prompt_id:
+        raise RuntimeError(f"ComfyUI /prompt did not return prompt_id: {data}")
 
-def handler(event: Dict[str, Any]) -> Dict[str, Any]:
+    # poll history until we see our prompt finished
+    for _ in range(120):  # ~120 * 0.5s = 60s
+        h = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=10)
+        if h.ok:
+            hjson = h.json()
+            if prompt_id in hjson and "outputs" in hjson[prompt_id]:
+                return hjson[prompt_id]
+        time.sleep(0.5)
+    raise TimeoutError("Timed out waiting for ComfyUI prompt to finish.")
+
+# -------- Minimal prompt that proves end-to-end output --------
+# Loads the first image and saves it (passthrough). This validates wiring fast.
+def _build_passthrough_prompt(input_filename: str) -> Dict[str, Any]:
+    return {
+        # Node IDs are strings in API format
+        "1": {  # LoadImage
+            "class_type": "LoadImage",
+            "inputs": {
+                "image": input_filename
+            }
+        },
+        "2": {  # SaveImage
+            "class_type": "SaveImage",
+            "inputs": {
+                "images": ["1", "IMAGE"]
+            }
+        }
+    }
+
+# -------- Handler --------
+
+def handler(event):
     """
     Supported ops:
-      - health_check: quick pass/fail used by tests.json
-      - comfy_ping: verify ComfyUI is up (optional)
-      - faceswap:  source_url + target_url -> (placeholder) echo result
+      - {"op": "health_check"}
+      - {"op": "faceswap", "source_url" or "source_b64", "target_url" or "target_b64"}
+        (currently passthrough to validate E2E; swaps will be wired next)
     """
-    req = event.get("input") or {}
-    op = req.get("op", "health_check")
+    _ensure_dirs()
+    inp = event.get("input", {}) if isinstance(event, dict) else {}
+    op = inp.get("op") or inp.get("operation")
 
-    # Minimal/fast test op (decoupled from repo assets)
     if op == "health_check":
-        return _ok(message="pong", comfy_url=COMFY_URL)
-
-    if op == "comfy_ping":
-        if _ensure_comfy_ready(30):
-            return _ok(comfy_url=COMFY_URL)
-        return _fail("ComfyUI not ready", comfy_url=COMFY_URL)
+        return {"ok": _ok(), "comfy_url": COMFY_URL}
 
     if op == "faceswap":
-        # This stub demonstrates receiving URLs and returning a URL.
-        # Wire to your Comfy workflow here once you’re ready.
-        source_url = req.get("source_url")
-        target_url = req.get("target_url")
-        if not source_url or not target_url:
-            return _fail("Provide source_url and target_url")
+        # Download (or decode) the two images
+        sid = f"src_{uuid.uuid4().hex}.png"
+        tid = f"tgt_{uuid.uuid4().hex}.png"
+        src_path = os.path.join(INPUT_DIR, sid)
+        tgt_path = os.path.join(INPUT_DIR, tid)
 
-        # Make sure ComfyUI is listening before we try to use it.
-        if not _ensure_comfy_ready(60):
-            return _fail("ComfyUI did not come up in time", comfy_url=COMFY_URL)
-
-        # Demo: validate we can fetch both images
         try:
-            _ = _download_to_b64(source_url)
-            _ = _download_to_b64(target_url)
+            if "source_url" in inp:
+                _download(inp["source_url"], src_path)
+            elif "source_b64" in inp:
+                _save_b64(inp["source_b64"], src_path)
+            else:
+                return {"error": "Provide 'source_url' or 'source_b64'."}
+
+            if "target_url" in inp:
+                _download(inp["target_url"], tgt_path)
+            elif "target_b64" in inp:
+                _save_b64(inp["target_b64"], tgt_path)
+            else:
+                return {"error": "Provide 'target_url' or 'target_b64'."}
         except Exception as e:
-            return _fail(f"Failed to fetch input images: {e}")
+            return {"error": f"Failed to fetch inputs: {e}"}
 
-        # TODO: Replace with your actual Comfy graph submission + polling
-        # For now, return source_url to prove round-trip works.
-        return _ok(result_url=source_url, comfy_url=COMFY_URL)
+        # For now: passthrough the SOURCE image -> SaveImage, to verify the pipeline.
+        # After confirmation, we’ll replace this with your actual faceswap workflow.
+        try:
+            prompt = _build_passthrough_prompt(sid)
+            result = _comfy_prompt(prompt)
+            # Gather saved files
+            saved = []
+            outputs = result.get("outputs", {})
+            for node_id, node_out in outputs.items():
+                # SaveImage writes under output dir; the API returns file info under "images"
+                images = node_out.get("images") or []
+                for im in images:
+                    # Comfy returns {"filename": "...", "subfolder": "...", "type": "output"}
+                    filename = im.get("filename")
+                    if filename:
+                        saved.append({
+                            "filename": filename,
+                            "path": os.path.join(OUTPUT_DIR, filename)
+                        })
+            return {
+                "ok": True,
+                "note": "Passthrough complete (this proves E2E). Swap wiring comes next.",
+                "outputs": saved
+            }
+        except Exception as e:
+            return {"error": f"ComfyUI prompt failed: {e}"}
 
-    return _fail(f"Unknown op '{op}'")
+    # default
+    return {"error": f"Unknown op '{op}'."}
 
+# Start the RunPod job loop
 runpod.serverless.start({"handler": handler})
