@@ -1,0 +1,31 @@
+{
+  "title": "Comfy Faceswap Worker",
+  "description": "Minimal test health/ping; GPU worker for faceswap via URL in/URL out.",
+  "type": "serverless",
+  "category": "image",
+  "iconUrl": "https://raw.githubusercontent.com/comfyanonymous/ComfyUI/master/comfyui.png",
+  "config": {
+    "runsOn": "GPU",
+    "containerDiskInGb": 40,
+    "presets": [
+      {
+        "name": "Default",
+        "defaults": {
+          "COMFY_MODE": "production",
+          "COMFY_BIND_HOST": "127.0.0.1",
+          "COMFY_BIND_PORT": "8188",
+          "INPUT_DIR": "/workspace/ComfyUI/input",
+          "OUTPUT_DIR": "/workspace/ComfyUI/output"
+        }
+      }
+    ],
+    "env": [
+      { "key": "COMFY_MODE", "value": "production" },
+      { "key": "COMFY_BIND_HOST", "value": "127.0.0.1" },
+      { "key": "COMFY_BIND_PORT", "value": "8188" },
+      { "key": "INPUT_DIR", "value": "/workspace/ComfyUI/input" },
+      { "key": "OUTPUT_DIR", "value": "/workspace/ComfyUI/output" },
+      { "key": "RP_HANDLER_PORT", "value": "8000" }
+    ]
+  }
+}
