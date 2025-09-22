@@ -1,82 +1,89 @@
-# handler.py
 import os
-import time
 import base64
-import asyncio
-import aiohttp
+import time
+import json
+import urllib.request
+from typing import Dict, Any
+
 import runpod
-from fastapi import FastAPI
-from pydantic import BaseModel
 
-COMFY_PORT = int(os.getenv("COMFY_PORT", "8188"))
-COMFY_URL = f"http://127.0.0.1:{COMFY_PORT}"
+COMFY_HOST = os.getenv("COMFY_BIND_HOST", "127.0.0.1")
+COMFY_PORT = int(os.getenv("COMFY_BIND_PORT", "8188"))
+COMFY_URL = f"http://{COMFY_HOST}:{COMFY_PORT}"
 
-# ---------- FastAPI app for uvicorn (start.sh) ----------
-app = FastAPI(title="Comfy Faceswap Worker")
-
-class RequestModel(BaseModel):
-    op: str
-    source_url: str | None = None
-    target_url: str | None = None
-
-async def _http_ok(url: str) -> bool:
+def _ping(url: str, timeout: float = 1.5) -> bool:
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, timeout=10) as r:
-                return r.status == 200
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            r.read()
+        return True
     except Exception:
         return False
 
-async def wait_for_comfy(timeout_s: int = 120) -> None:
-    start = time.time()
-    while time.time() - start < timeout_s:
-        if await _http_ok(f"{COMFY_URL}/system_stats"):
-            return
-        await asyncio.sleep(1)
-    raise RuntimeError("ComfyUI did not come up in time.")
+def _ensure_comfy_ready(max_wait_s: int = 30) -> bool:
+    """Light readiness gate used by ops that need Comfy."""
+    for _ in range(max_wait_s):
+        if _ping(f"{COMFY_URL}/system_stats"):
+            return True
+        time.sleep(1)
+    return False
 
-@app.get("/health")
-async def health():
-    ok = await _http_ok(f"{COMFY_URL}/system_stats")
-    return {"ok": ok, "comfy_url": COMFY_URL}
+def _download_to_b64(u: str) -> str:
+    with urllib.request.urlopen(u, timeout=15) as r:
+        data = r.read()
+    return base64.b64encode(data).decode("utf-8")
 
-# ---------- RunPod job handler ----------
-def run_job(event):
-    """RunPod entrypoint: expects event['input'] with 'op'."""
-    inp = event.get("input") or {}
-    op = inp.get("op", "health_check")
+def _ok(**kw) -> Dict[str, Any]:
+    o = {"ok": True}
+    o.update(kw)
+    return o
 
+def _fail(msg: str, **kw) -> Dict[str, Any]:
+    o = {"ok": False, "error": msg}
+    o.update(kw)
+    return o
+
+def handler(event: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Supported ops:
+      - health_check: quick pass/fail used by tests.json
+      - comfy_ping: verify ComfyUI is up (optional)
+      - faceswap:  source_url + target_url -> (placeholder) echo result
+    """
+    req = event.get("input") or {}
+    op = req.get("op", "health_check")
+
+    # Minimal/fast test op (decoupled from repo assets)
     if op == "health_check":
-        return {"ok": True, "comfy_url": COMFY_URL}
+        return _ok(message="pong", comfy_url=COMFY_URL)
+
+    if op == "comfy_ping":
+        if _ensure_comfy_ready(30):
+            return _ok(comfy_url=COMFY_URL)
+        return _fail("ComfyUI not ready", comfy_url=COMFY_URL)
 
     if op == "faceswap":
-        src = inp.get("source_url")
-        tgt = inp.get("target_url")
-        if not src or not tgt:
-            raise ValueError("Provide 'source_url' and 'target_url'.")
+        # This stub demonstrates receiving URLs and returning a URL.
+        # Wire to your Comfy workflow here once you’re ready.
+        source_url = req.get("source_url")
+        target_url = req.get("target_url")
+        if not source_url or not target_url:
+            return _fail("Provide source_url and target_url")
 
-        # Ensure ComfyUI up
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(wait_for_comfy(120))
+        # Make sure ComfyUI is listening before we try to use it.
+        if not _ensure_comfy_ready(60):
+            return _fail("ComfyUI did not come up in time", comfy_url=COMFY_URL)
 
-        # Just validate the URLs resolve before you wire the workflow
-        ok_src = loop.run_until_complete(_http_ok(src))
-        ok_tgt = loop.run_until_complete(_http_ok(tgt))
-        if not ok_src or not ok_tgt:
-            raise ValueError("source_url or target_url is not reachable.")
+        # Demo: validate we can fetch both images
+        try:
+            _ = _download_to_b64(source_url)
+            _ = _download_to_b64(target_url)
+        except Exception as e:
+            return _fail(f"Failed to fetch input images: {e}")
 
-        # TODO: Call your ComfyUI workflow here (POST /prompt with your graph)
-        # and then parse the result and return a URL to the output (S3/volume).
-        # For now we return a stub so the op is recognized and the pipeline runs.
-        return {
-            "ok": True,
-            "message": "faceswap op stub executed (wire your workflow next).",
-            "comfy_url": COMFY_URL
-        }
+        # TODO: Replace with your actual Comfy graph submission + polling
+        # For now, return source_url to prove round-trip works.
+        return _ok(result_url=source_url, comfy_url=COMFY_URL)
 
-    raise ValueError(f"Unknown op '{op}'.")
+    return _fail(f"Unknown op '{op}'")
 
-# Wire for RunPod serverless
-runpod.serverless.start(
-    {"handler": run_job}
-)
+runpod.serverless.start({"handler": handler})
