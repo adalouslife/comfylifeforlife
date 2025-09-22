@@ -1,0 +1,18 @@
+{
+  "tests": [
+    {
+      "name": "health_cpu_v3",
+      "input": { "op": "health" },
+      "timeout": 20000
+    }
+  ],
+  "config": {
+    "cpuFlavor": "CPU-4C-8GB",
+    "env": [
+      { "key": "RUNPOD_TEST_MODE", "value": "true" },
+      { "key": "COMFY_HOST", "value": "127.0.0.1" },
+      { "key": "COMFY_PORT", "value": "8188" },
+      { "key": "STORAGE_DIR", "value": "/runpod-volume" }
+    ]
+  }
+}
