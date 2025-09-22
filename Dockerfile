@@ -1,36 +1,58 @@
-# Base image (CUDA 12.1 + Python)
-FROM runpod/base:0.6.2-cuda12.1.1
+# Base image (CUDA 12.1 + Python) — this tag EXISTS
+FROM runpod/base:0.6.1-cuda12.1.1
 
-# Prevent interactive tzdata etc.
-ENV DEBIAN_FRONTEND=noninteractive
+# Keep apt non-interactive
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1
 
-# System deps: curl for robust URL fallback
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+# OS deps and tini for 'clean' process handling
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl wget ca-certificates tini \
+    libgl1 libglib2.0-0 \
+ && rm -rf /var/lib/apt/lists/*
 
-# Create workspace
+# Workdir
 WORKDIR /workspace
 
-# Copy project files
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# ---- ComfyUI (optional but harmless for tests) ----
+# Put ComfyUI where your scripts expect it
+RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git /workspace/ComfyUI
 
-COPY . /workspace
+# Copy your repo files
+COPY requirements.txt /workspace/requirements.txt
+COPY start.sh /workspace/start.sh
+COPY handler.py /workspace/handler.py
+COPY install_custom_nodes.py /workspace/install_custom_nodes.py
+COPY download_models.sh /workspace/download_models.sh
+COPY custom_nodes.txt /workspace/custom_nodes.txt
 
-# Ensure scripts are executable
-RUN chmod +x /workspace/start.sh || true
+# Permissions
+RUN chmod +x /workspace/start.sh /workspace/download_models.sh
 
-# Expose ComfyUI port (internal)
-ENV COMFY_HOST=127.0.0.1
-ENV COMFY_PORT=8188
+# Python deps
+RUN python3 -m pip install --upgrade pip && \
+    python3 -m pip install -r /workspace/requirements.txt && \
+    # Always have runpod SDK available
+    python3 -m pip install --no-cache-dir runpod
 
-# Default input/output (can be overridden by env)
-ENV INPUT_DIR=/workspace/ComfyUI/input
-ENV OUTPUT_DIR=/workspace/ComfyUI/output
+# Default envs (can be overridden in the endpoint)
+ENV RP_HANDLER="handler" \
+    RP_HANDLER_PORT="8000" \
+    COMFY_PORT="8188" \
+    COMFY_MODE="production" \
+    INPUT_DIR="/workspace/ComfyUI/input" \
+    OUTPUT_DIR="/workspace/ComfyUI/output"
 
-# RunPod handler port
-ENV RP_HANDLER_PORT=8000
+# Make sure input/output directories exist
+RUN mkdir -p ${INPUT_DIR} ${OUTPUT_DIR}
 
-# Start the ComfyUI backend + handler
-CMD ["/bin/bash", "-lc", "/workspace/start.sh"]
+# Expose the ports (not strictly required for Serverless, but good hygiene)
+EXPOSE 8000 8188
+
+# Use tini as entrypoint
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+# Start your orchestrator (this should start ComfyUI and the handler)
+CMD ["/workspace/start.sh"]
