@@ -1,73 +1,52 @@
-# ---------- Base: Official, stable, CUDA 12.1 runtime on Ubuntu 22.04 ----------
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+# =========================
+# Comfy Faceswap Serverless
+# =========================
 
-# Avoid interactive tzdata, etc.
+# CUDA base that matches RunPod GPUs
+FROM runpod/serverless:gpu-cuda12.1.1
+
+# Non-interactive APT
 ENV DEBIAN_FRONTEND=noninteractive
-SHELL ["/bin/bash", "-lc"]
 
-# ---------- OS deps ----------
+# Basic OS deps + Python tooling + ffmpeg, git, etc.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.10 python3.10-venv python3-pip \
-    git curl ca-certificates \
-    libgl1 libglib2.0-0 libsm6 libxrender1 libxext6 \
-    ffmpeg wget unzip \
- && rm -rf /var/lib/apt/lists/*
+    python3 python3-dev python3-pip python3-venv python3-distutils python3-setuptools python3-wheel \
+    ca-certificates curl wget git git-lfs \
+    ffmpeg libgl1 libglib2.0-0 libxext6 libxrender1 libsm6 \
+    && rm -rf /var/lib/apt/lists/*
 
-# Make python available as `python` + `pip`
-RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 && \
-    update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1
+# Ensure `python` exists (RunPod health/tests sometimes assume it)
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 10
 
-# ---------- Workspace ----------
+# Workdir
 WORKDIR /workspace
 
-# (Optional) Create comfy dirs we’ll use
-ENV COMFY_ROOT=/workspace/ComfyUI
+# Copy repo content
+COPY . /workspace
+
+# Make scripts executable
+RUN chmod +x /workspace/start.sh /workspace/download_models.sh
+
+# Install Python deps first (layer cache)
+RUN pip install --no-cache-dir --upgrade pip \
+ && if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
+
+# (Optional) install custom nodes + models if present
+# Won't fail the build if those scripts are not required.
+RUN /bin/bash -lc 'if [ -f install_custom_nodes.py ]; then python install_custom_nodes.py || true; fi'
+RUN /bin/bash -lc 'if [ -f download_models.sh ]; then ./download_models.sh || true; fi'
+
+# RunPod handler port
+ENV RP_HANDLER_PORT=8000
+# ComfyUI defaults
+ENV COMFY_BIND_HOST=127.0.0.1
+ENV COMFY_BIND_PORT=8188
+ENV COMFY_MODE=production
 ENV INPUT_DIR=/workspace/ComfyUI/input
 ENV OUTPUT_DIR=/workspace/ComfyUI/output
-RUN mkdir -p "${COMFY_ROOT}" "${INPUT_DIR}" "${OUTPUT_DIR}"
 
-# ---------- Python venv (optional but clean) ----------
-RUN python -m venv /opt/venv && \
-    echo 'source /opt/venv/bin/activate' >> /etc/bash.bashrc
-ENV VIRTUAL_ENV=/opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
-# ---------- Install serverless runtime + GPU stack ----------
-# Pin to CUDA 12.1 wheels
-RUN pip install --upgrade pip wheel setuptools && \
-    pip install --index-url https://download.pytorch.org/whl/cu121 \
-        torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 && \
-    pip install xformers==0.0.27.post2 --extra-index-url https://download.pytorch.org/whl/cu121 && \
-    pip install runpod==1.7.13 uvicorn fastapi aiohttp requests
-
-# ---------- Get ComfyUI ----------
-RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git "${COMFY_ROOT}"
-
-# ComfyUI requirements (lean + robust)
-# ComfyUI’s requirements.txt is light; most heavy deps covered above.
-RUN pip install -r "${COMFY_ROOT}/requirements.txt" || true
-
-# ---------- Your repo files ----------
-# Copy only what we need; keep the context small
-COPY handler.py /workspace/app/handler.py
-COPY start.sh   /workspace/app/start.sh
-RUN chmod +x /workspace/app/start.sh
-
-# If you keep these in repo, copy them; if not, this is safe to omit:
-# COPY download_models.sh /workspace/app/download_models.sh
-# RUN chmod +x /workspace/app/download_models.sh && /workspace/app/download_models.sh
-
-# ---------- Ports & env ----------
-ENV COMFY_MODE=production
-ENV COMFY_PORT=8188
-ENV HOST=0.0.0.0
-ENV RP_HANDLER_PORT=8000
-
-EXPOSE 8188
+# Expose handler port (RunPod sidecar will bind to this)
 EXPOSE 8000
 
-# ---------- Health (optional but helps) ----------
-HEALTHCHECK --interval=30s --timeout=10s --retries=10 CMD curl -sf http://127.0.0.1:${COMFY_PORT}/system_stats || exit 1
-
-# ---------- Start ----------
-CMD ["/workspace/app/start.sh"]
+# Final command
+CMD ["/workspace/start.sh"]
