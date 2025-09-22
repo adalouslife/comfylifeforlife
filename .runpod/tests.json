@@ -1,0 +1,18 @@
+{
+  "tests": [
+    {
+      "name": "smoke_ping",
+      "input": { "op": "health_check", "nonce": "v2" },
+      "timeout": 15000
+    }
+  ],
+  "config": {
+    "gpuTypeId": "NVIDIA L40S",
+    "gpuCount": 1,
+    "env": [
+      { "key": "RUNPOD_TEST_MODE", "value": "true" },
+      { "key": "RP_HANDLER_PORT", "value": "8000" }
+    ],
+    "allowedCudaVersions": ["12.7", "12.6", "12.5", "12.4", "12.3", "12.2", "12.1"]
+  }
+}
