@@ -1,0 +1,31 @@
+{
+  "tests": [
+    {
+      "name": "basic_text_echo",
+      "input": {
+        "message": "Ping from RunPod",
+        "locale": "en-US"
+      },
+      "timeout": 12000
+    }
+  ],
+  "config": {
+    "gpuTypeId": "NVIDIA GeForce RTX 4090",
+    "gpuCount": 1,
+    "env": [
+      {
+        "key": "RUNPOD_MODE",
+        "value": "sanity_test"
+      }
+    ],
+    "allowedCudaVersions": [
+      "12.7",
+      "12.6",
+      "12.5",
+      "12.4",
+      "12.3",
+      "12.2",
+      "12.1"
+    ]
+  }
+}
