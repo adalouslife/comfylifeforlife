@@ -1,6 +1,6 @@
 {
   "title": "Comfy Faceswap Worker",
-  "description": "Starts ComfyUI first, then serves a simple health/faceswap stub.",
+  "description": "Lightweight health check for tests; full GPU worker for requests.",
   "type": "serverless",
   "category": "image",
   "iconUrl": "https://raw.githubusercontent.com/comfyanonymous/ComfyUI/master/comfyui.png",
