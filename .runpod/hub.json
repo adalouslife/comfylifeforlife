@@ -1,0 +1,27 @@
+{
+  "title": "Comfy Faceswap Worker GPU",
+  "description": "Simple health/ping for tests; full GPU worker at runtime.",
+  "type": "serverless",
+  "category": "image",
+  "iconUrl": "https://raw.githubusercontent.com/comfyanonymous/ComfyUI/master/comfyui.png",
+  "config": {
+    "runsOn": "GPU",
+    "containerDiskInGb": 40,
+    "presets": [
+      {
+        "name": "Default",
+        "defaults": {
+          "COMFY_MODE": "production",
+          "INPUT_DIR": "/workspace/ComfyUI/input",
+          "OUTPUT_DIR": "/workspace/ComfyUI/output"
+        }
+      }
+    ],
+    "env": [
+      { "key": "COMFY_MODE", "value": "production" },
+      { "key": "INPUT_DIR", "value": "/workspace/ComfyUI/input" },
+      { "key": "OUTPUT_DIR", "value": "/workspace/ComfyUI/output" },
+      { "key": "RP_HANDLER_PORT", "value": "8000" }
+    ]
+  }
+}
