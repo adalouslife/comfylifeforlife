@@ -1,38 +1,24 @@
-import os
-import io
-import json
-import time
-import uuid
-import base64
-import shutil
-import random
-import string
-import logging
-import pathlib
-import requests
-import runpod
-import subprocess
+import os, io, sys, json, time, uuid, base64, shutil, random, string, logging, pathlib, requests, runpod, subprocess
 from typing import Dict, Any, List, Tuple, Optional
 
 # ---------- Config ----------
 COMFY_HOST = os.getenv("COMFY_HOST", "127.0.0.1")
 COMFY_PORT = int(os.getenv("COMFY_PORT", "8188"))
-COMFY_URL  = f"http://{COMFY_HOST}:{COMFY_PORT}"
+COMFY_URL = f"http://{COMFY_HOST}:{COMFY_PORT}"
 
-WORKDIR        = pathlib.Path("/workspace")
-COMFY_DIR      = WORKDIR / "ComfyUI"
-INPUT_DIR      = COMFY_DIR / "input"
-OUTPUT_DIR     = COMFY_DIR / "output"
-WORKFLOW_PATH  = WORKDIR / "comfyui" / "workflows" / "APIAutoFaceACE.json"
+WORKDIR = pathlib.Path("/workspace")
+COMFY_DIR = WORKDIR / "ComfyUI"
+INPUT_DIR = COMFY_DIR / "input"
+OUTPUT_DIR = COMFY_DIR / "output"
+WORKFLOW_PATH = WORKDIR / "comfyui" / "workflows" / "APIAutoFaceACE.json"
 
-STORAGE_DIR    = pathlib.Path(os.getenv("STORAGE_DIR", "/runpod-volume"))
+STORAGE_DIR = pathlib.Path(os.getenv("STORAGE_DIR", "/runpod-volume"))
 
-# Node IDs inside APIAutoFaceACE.json
-FACE_NODE_ID   = "240"  # Load New Face
-BASE_NODE_ID   = "420"  # Load Image
+# Node IDs inside APIAutoFaceACE.json (your note)
+FACE_NODE_ID = "240"  # Load New Face
+BASE_NODE_ID = "420"  # Load Image
 
-# Start Comfy only once
-COMFY_STARTED  = False
+COMFY_STARTED = False
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("handler")
@@ -42,7 +28,7 @@ def _rand_token(n=8) -> str:
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
 def _sleep_ms(ms: int):
-    time.sleep(ms/1000.0)
+    time.sleep(ms / 1000.0)
 
 def _http_get(url: str, **kw) -> requests.Response:
     r = requests.get(url, timeout=kw.pop("timeout", 30), **kw)
@@ -56,9 +42,7 @@ def _http_post(url: str, json=None, data=None, files=None, **kw) -> requests.Res
 
 # ---------- Catbox upload ----------
 def _upload_to_catbox(binary: bytes, filename: str) -> str:
-    files = {
-        'fileToUpload': (filename, io.BytesIO(binary), 'application/octet-stream')
-    }
+    files = {'fileToUpload': (filename, io.BytesIO(binary), 'application/octet-stream')}
     data = {'reqtype': 'fileupload'}
     r = _http_post("https://catbox.moe/user/api.php", data=data, files=files, timeout=120)
     url = r.text.strip()
@@ -75,6 +59,7 @@ def _start_comfy_once():
     # Make sure input/output exist (and symlink into STORAGE_DIR if present)
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
     if STORAGE_DIR.exists():
         (STORAGE_DIR / "inputs").mkdir(parents=True, exist_ok=True)
         (STORAGE_DIR / "outputs").mkdir(parents=True, exist_ok=True)
@@ -92,27 +77,29 @@ def _start_comfy_once():
 
     env = os.environ.copy()
     cmd = [
-        "python", "-u", str(COMFY_DIR / "main.py"),
+        sys.executable, "-u", str(COMFY_DIR / "main.py"),
         "--listen", COMFY_HOST,
         "--port", str(COMFY_PORT),
         "--disable-auto-launch",
         "--highvram",
-        "--cuda-device", "0"
+        "--cuda-device", "0",
     ]
     subprocess.Popen(cmd, cwd=str(COMFY_DIR), env=env)
     log.info(f"Started ComfyUI at {COMFY_URL}")
 
     # Wait for server to be ready
-    deadline = time.time() + 120
+    deadline = time.time() + 180  # give it up to 3 minutes on cold start
+    last_err = None
     while time.time() < deadline:
         try:
             _http_get(f"{COMFY_URL}/system_stats", timeout=3)
             COMFY_STARTED = True
             log.info("ComfyUI is ready.")
             return
-        except Exception:
+        except Exception as e:
+            last_err = e
             _sleep_ms(500)
-    raise RuntimeError("ComfyUI did not come up in time.")
+    raise RuntimeError(f"ComfyUI did not come up in time: {last_err}")
 
 # ---------- Comfy API ----------
 def _queue_prompt(prompt_map: Dict[str, Any], client_id: Optional[str] = None) -> str:
@@ -144,9 +131,8 @@ def _fetch_output_images(history_item: Dict[str, Any]) -> List[Tuple[bytes, str]
     results: List[Tuple[bytes, str]] = []
     for node_id, node_out in history_item.get("outputs", {}).items():
         for img in node_out.get("images", []):
-            filename  = img.get("filename")
+            filename = img.get("filename")
             subfolder = img.get("subfolder", "")
-            # type is always 'output' for saved images
             view_url = f"{COMFY_URL}/view?filename={filename}&subfolder={subfolder}&type=output"
             resp = _http_get(view_url, timeout=60)
             results.append((resp.content, filename))
@@ -172,12 +158,10 @@ def _load_workflow(path: pathlib.Path) -> Dict[str, Any]:
 def _patch_images_in_prompt(prompt_map: Dict[str, Any], face_filename: str, base_filename: str):
     """
     Replace image filenames in two LoadImage nodes.
-    Prefers node IDs FACE_NODE_ID and BASE_NODE_ID; if missing, falls back to
-    selecting the first two LoadImage nodes found.
+    Prefers node IDs FACE_NODE_ID and BASE_NODE_ID; if missing, falls back to selecting the first two LoadImage nodes found.
     """
     def is_load_image(node_def: Dict[str, Any]) -> bool:
         return node_def.get("class_type") == "LoadImage"
-
     def set_image(node_def: Dict[str, Any], filename: str):
         node_def.setdefault("inputs", {})["image"] = filename
 
@@ -205,7 +189,6 @@ def _patch_images_in_prompt(prompt_map: Dict[str, Any], face_filename: str, base
 # ---------- Ops ----------
 def _op_health_check(_: Dict[str, Any]) -> Dict[str, Any]:
     _start_comfy_once()
-    # quick ping
     _http_get(f"{COMFY_URL}/system_stats", timeout=5)
     return {"ok": True, "comfy_url": COMFY_URL}
 
@@ -227,16 +210,16 @@ def _op_comfy_passthrough(inp: Dict[str, Any]) -> Dict[str, Any]:
 def _op_swap(inp: Dict[str, Any]) -> Dict[str, Any]:
     """
     Face swap using comfyui/workflows/APIAutoFaceACE.json
+
     input:
       - source_url: face image URL (the face to insert)
       - target_url: base image URL
+
     returns: { images: [catbox URLs...] }
     """
     _start_comfy_once()
-
     source_url = inp.get("source_url") or inp.get("source")
     target_url = inp.get("target_url") or inp.get("target")
-
     if not source_url or not target_url:
         raise ValueError("Provide 'source_url' and 'target_url'.")
 
