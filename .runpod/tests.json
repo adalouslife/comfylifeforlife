@@ -1,0 +1,29 @@
+{
+  "tests": [
+    {
+      "name": "ping_ok",
+      "input": {
+        "op": "health_check"
+      },
+      "timeout": 15000
+    }
+  ],
+  "config": {
+    "gpuTypeId": "NVIDIA GeForce RTX 4090",
+    "gpuCount": 1,
+    "env": [
+      { "key": "RUNPOD_TEST_MODE", "value": "true" },
+      { "key": "TEST_NOTE", "value": "lite_ping_only" }
+    ],
+    "allowedCudaVersions": [
+      "12.7",
+      "12.6",
+      "12.5",
+      "12.4",
+      "12.3",
+      "12.2",
+      "12.1",
+      "12.0"
+    ]
+  }
+}
