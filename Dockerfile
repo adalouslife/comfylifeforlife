@@ -1,67 +1,73 @@
-# ===== Base image =====
-FROM runpod/pytorch:2.5.1-py3.10-cuda12.1.1
+# ---------- Base: Official, stable, CUDA 12.1 runtime on Ubuntu 22.04 ----------
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
-# Avoid interactive tzdata etc.
-ENV DEBIAN_FRONTEND=noninteractive \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PYTHONUNBUFFERED=1 \
-    UV_HTTP_TIMEOUT=180
+# Avoid interactive tzdata, etc.
+ENV DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-lc"]
 
-# ===== OS deps =====
+# ---------- OS deps ----------
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git wget curl ca-certificates ffmpeg tini \
+    python3.10 python3.10-venv python3-pip \
+    git curl ca-certificates \
+    libgl1 libglib2.0-0 libsm6 libxrender1 libxext6 \
+    ffmpeg wget unzip \
  && rm -rf /var/lib/apt/lists/*
 
-# Ensure `python` exists (some images only have python3)
-RUN ln -sf /usr/bin/python3 /usr/bin/python || true
+# Make python available as `python` + `pip`
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 && \
+    update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1
 
-# ===== Workspace layout =====
+# ---------- Workspace ----------
 WORKDIR /workspace
 
-# Clone ComfyUI at a known-good commit
-# (You can bump this later if needed; pinning avoids random upstream breaks.)
-RUN git clone https://github.com/comfyanonymous/ComfyUI.git && \
-    cd ComfyUI && \
-    git rev-parse HEAD > /workspace/COMFY_COMMIT.txt
+# (Optional) Create comfy dirs we’ll use
+ENV COMFY_ROOT=/workspace/ComfyUI
+ENV INPUT_DIR=/workspace/ComfyUI/input
+ENV OUTPUT_DIR=/workspace/ComfyUI/output
+RUN mkdir -p "${COMFY_ROOT}" "${INPUT_DIR}" "${OUTPUT_DIR}"
 
-# Install ComfyUI requirements
-RUN python3 -m pip install --no-cache-dir -r /workspace/ComfyUI/requirements.txt
+# ---------- Python venv (optional but clean) ----------
+RUN python -m venv /opt/venv && \
+    echo 'source /opt/venv/bin/activate' >> /etc/bash.bashrc
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
-# ===== App files =====
-# (We keep your repo code in /workspace/app)
-COPY start.sh /workspace/app/start.sh
+# ---------- Install serverless runtime + GPU stack ----------
+# Pin to CUDA 12.1 wheels
+RUN pip install --upgrade pip wheel setuptools && \
+    pip install --index-url https://download.pytorch.org/whl/cu121 \
+        torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 && \
+    pip install xformers==0.0.27.post2 --extra-index-url https://download.pytorch.org/whl/cu121 && \
+    pip install runpod==1.7.13 uvicorn fastapi aiohttp requests
+
+# ---------- Get ComfyUI ----------
+RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git "${COMFY_ROOT}"
+
+# ComfyUI requirements (lean + robust)
+# ComfyUI’s requirements.txt is light; most heavy deps covered above.
+RUN pip install -r "${COMFY_ROOT}/requirements.txt" || true
+
+# ---------- Your repo files ----------
+# Copy only what we need; keep the context small
 COPY handler.py /workspace/app/handler.py
-COPY requirements.txt /workspace/app/requirements.txt
-
-# Any optional lists/scripts you have; safe to copy if present.
-# (If you don't have them, Docker will still build — they aren't required steps.)
-COPY custom_nodes.txt /workspace/app/custom_nodes.txt
-COPY install_custom_nodes.py /workspace/app/install_custom_nodes.py
-COPY download_models.sh /workspace/app/download_models.sh
-
-# Python deps for the handler/utility code
-RUN python3 -m pip install --no-cache-dir -r /workspace/app/requirements.txt || true
-# Minimal hardens (in case requirements.txt is empty)
-RUN python3 -m pip install --no-cache-dir runpod requests pillow
-
-# Make entry executable
+COPY start.sh   /workspace/app/start.sh
 RUN chmod +x /workspace/app/start.sh
 
-# Provide standard dirs (match your env)
-RUN mkdir -p /workspace/ComfyUI/input /workspace/ComfyUI/output /workspace/ComfyUI/models
+# If you keep these in repo, copy them; if not, this is safe to omit:
+# COPY download_models.sh /workspace/app/download_models.sh
+# RUN chmod +x /workspace/app/download_models.sh && /workspace/app/download_models.sh
 
-# ===== Environment =====
-ENV COMFY_DIR=/workspace/ComfyUI \
-    COMFY_HOST=127.0.0.1 \
-    COMFY_PORT=8188 \
-    RP_HANDLER_PORT=8000 \
-    INPUT_DIR=/workspace/ComfyUI/input \
-    OUTPUT_DIR=/workspace/ComfyUI/output
+# ---------- Ports & env ----------
+ENV COMFY_MODE=production
+ENV COMFY_PORT=8188
+ENV HOST=0.0.0.0
+ENV RP_HANDLER_PORT=8000
 
-EXPOSE 8000 8188
+EXPOSE 8188
+EXPOSE 8000
 
-# Use tini as PID1 for correct signal handling
-ENTRYPOINT ["/usr/bin/tini", "--"]
+# ---------- Health (optional but helps) ----------
+HEALTHCHECK --interval=30s --timeout=10s --retries=10 CMD curl -sf http://127.0.0.1:${COMFY_PORT}/system_stats || exit 1
 
-# Start script:
-CMD ["bash", "-lc", "/workspace/app/start.sh"]
+# ---------- Start ----------
+CMD ["/workspace/app/start.sh"]
