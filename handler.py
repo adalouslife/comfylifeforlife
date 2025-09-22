@@ -1,159 +1,219 @@
 import os
-import io
 import time
 import json
-import uuid
-import base64
-import runpod
 import shutil
-import requests
-from typing import Dict, Any
+import base64
+import logging
+import subprocess
+from pathlib import Path
+from typing import Dict, Any, Optional
 
+import runpod
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# -----------------------------
+# Env / Paths
+# -----------------------------
 COMFY_HOST = os.getenv("COMFY_HOST", "127.0.0.1")
 COMFY_PORT = int(os.getenv("COMFY_PORT", "8188"))
-COMFY_URL  = f"http://{COMFY_HOST}:{COMFY_PORT}"
+COMFY_URL = f"http://{COMFY_HOST}:{COMFY_PORT}"
 
-INPUT_DIR  = os.getenv("INPUT_DIR", "/workspace/ComfyUI/input")
-OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/workspace/ComfyUI/output")
+INPUT_DIR = Path(os.getenv("INPUT_DIR", "/workspace/ComfyUI/input"))
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "/workspace/ComfyUI/output"))
+WORK_DIR = Path("/workspace")
 
-# -------- Utilities --------
+INPUT_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-def _ok() -> bool:
-    try:
-        r = requests.get(f"{COMFY_URL}/system_stats", timeout=5)
-        return r.ok
-    except Exception:
-        return False
+# -----------------------------
+# Logging
+# -----------------------------
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+log = logging.getLogger("handler")
 
-def _download(url: str, dest_path: str) -> str:
-    r = requests.get(url, timeout=30, stream=True)
-    r.raise_for_status()
-    with open(dest_path, "wb") as f:
-        for chunk in r.iter_content(1024 * 1024):
-            if chunk:
+# -----------------------------
+# Robust HTTP Session
+# -----------------------------
+def _build_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        # Some hosts close the connection if UA is missing or too generic.
+        "User-Agent": "runpod-comfy-faceswap/1.0 (+https://runpod.io)",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+    })
+    retries = Retry(
+        total=4,
+        connect=4,
+        read=4,
+        backoff_factor=0.6,
+        status_forcelist=(500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "HEAD"]),
+        raise_on_status=False,
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retries, pool_maxsize=8)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
+
+SESSION = _build_session()
+
+# -----------------------------
+# Utility: download or decode inputs
+# -----------------------------
+def _safe_filename(name: str) -> str:
+    keep = "".join(c for c in name if c.isalnum() or c in ("-", "_", "."))
+    return keep or "file"
+
+def _download_with_requests(url: str, dest: Path, timeout: float = 25.0) -> None:
+    with SESSION.get(url, stream=True, allow_redirects=True, timeout=timeout) as r:
+        r.raise_for_status()
+        ctype = r.headers.get("Content-Type", "")
+        if "text/html" in ctype and not url.lower().endswith((".jpg",".jpeg",".png",".webp",".bmp",".gif",".tiff",".tif")):
+            # Servers sometimes send HTML if blocked; reject clearly.
+            raise RuntimeError(f"Remote responded with HTML instead of an image (content-type={ctype}).")
+        # Cap to ~100MB just in case
+        max_bytes = 100 * 1024 * 1024
+        got = 0
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 256):
+                if not chunk:
+                    continue
+                got += len(chunk)
+                if got > max_bytes:
+                    raise RuntimeError("Downloaded file exceeds 100MB limit.")
                 f.write(chunk)
-    return dest_path
 
-def _save_b64(b64: str, dest_path: str) -> str:
-    with open(dest_path, "wb") as f:
-        f.write(base64.b64decode(b64))
-    return dest_path
+def _download_with_curl(url: str, dest: Path, timeout: int = 30) -> None:
+    # Fallback path when some hosts dislike Python TLS stack.
+    cmd = [
+        "curl", "-L", "--fail", "--show-error",
+        "--max-time", str(timeout),
+        "-A", "runpod-comfy-faceswap/1.0",
+        "-o", str(dest),
+        url,
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0 or not dest.exists() or dest.stat().st_size == 0:
+        raise RuntimeError(f"curl failed: {proc.stderr.strip()}")
 
-def _ensure_dirs():
-    os.makedirs(INPUT_DIR, exist_ok=True)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-def _comfy_prompt(prompt: Dict[str, Any]) -> Dict[str, Any]:
+def fetch_image_to_path(
+    *,
+    source_url: Optional[str] = None,
+    source_b64: Optional[str] = None,
+    name_hint: str = "input.jpg"
+) -> Path:
     """
-    Sends a prompt to ComfyUI /prompt and waits for output filenames
-    saved by the SaveImage node(s).
+    Save an input image into INPUT_DIR and return the path.
+    - Prefer URL if provided; else expect base64.
+    - Robust retries + curl fallback for fragile hosts.
     """
-    # queue the prompt
-    resp = requests.post(f"{COMFY_URL}/prompt", json={"prompt": prompt}, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    prompt_id = data.get("prompt_id")
-    if not prompt_id:
-        raise RuntimeError(f"ComfyUI /prompt did not return prompt_id: {data}")
+    INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    filename = _safe_filename(Path(name_hint).name)
+    dest = INPUT_DIR / filename
 
-    # poll history until we see our prompt finished
-    for _ in range(120):  # ~120 * 0.5s = 60s
-        h = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=10)
-        if h.ok:
-            hjson = h.json()
-            if prompt_id in hjson and "outputs" in hjson[prompt_id]:
-                return hjson[prompt_id]
-        time.sleep(0.5)
-    raise TimeoutError("Timed out waiting for ComfyUI prompt to finish.")
+    if source_url:
+        try:
+            _download_with_requests(source_url, dest)
+        except Exception as e_req:
+            log.info(f"[fetch] Python requests failed: {e_req} — trying curl fallback.")
+            try:
+                _download_with_curl(source_url, dest)
+            except Exception as e_curl:
+                raise RuntimeError(f"Failed to download url: {source_url}; requests: {e_req}; curl: {e_curl}") from e_curl
+        if dest.stat().st_size == 0:
+            raise RuntimeError("Downloaded file is empty.")
+        return dest
 
-# -------- Minimal prompt that proves end-to-end output --------
-# Loads the first image and saves it (passthrough). This validates wiring fast.
-def _build_passthrough_prompt(input_filename: str) -> Dict[str, Any]:
+    if source_b64:
+        try:
+            raw = base64.b64decode(source_b64, validate=True)
+        except Exception as e:
+            raise RuntimeError(f"Invalid base64 image: {e}") from e
+        if len(raw) == 0:
+            raise RuntimeError("Base64 image is empty.")
+        with open(dest, "wb") as f:
+            f.write(raw)
+        return dest
+
+    raise ValueError("Provide 'source_b64' or 'source_url'.")
+
+# -----------------------------
+# ComfyUI readiness
+# -----------------------------
+def wait_for_comfy_ready(timeout_s: int = 60) -> None:
+    import urllib.parse
+    endpoint = f"{COMFY_URL}/system_stats"
+    t0 = time.time()
+    last_err = None
+    while time.time() - t0 < timeout_s:
+        try:
+            r = SESSION.get(endpoint, timeout=5)
+            if r.ok:
+                return
+            last_err = f"HTTP {r.status_code}"
+        except Exception as e:
+            last_err = str(e)
+        time.sleep(1.0)
+    raise RuntimeError(f"ComfyUI did not come up in time: {last_err}")
+
+# -----------------------------
+# Minimal fake pipeline for tests
+# -----------------------------
+def op_health_check(_: Dict[str, Any]) -> Dict[str, Any]:
+    wait_for_comfy_ready(timeout_s=30)
+    return {"ok": True, "comfy_url": COMFY_URL}
+
+# -----------------------------
+# Faceswap op (skeleton – wire to your workflow submission)
+# -----------------------------
+def op_faceswap(body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Expects:
+      body = {
+        "op": "faceswap",
+        "source_url": "...",  # or source_b64
+        "target_url": "...",  # or target_b64
+      }
+    """
+    wait_for_comfy_ready(timeout_s=60)
+
+    src_url = body.get("source_url")
+    src_b64 = body.get("source_b64")
+    tgt_url = body.get("target_url")
+    tgt_b64 = body.get("target_b64")
+
+    try:
+        src_path = fetch_image_to_path(source_url=src_url, source_b64=src_b64, name_hint="source.jpg")
+        tgt_path = fetch_image_to_path(source_url=tgt_url, source_b64=tgt_b64, name_hint="target.jpg")
+    except Exception as e:
+        raise RuntimeError(f"Failed to fetch inputs: {e}") from e
+
+    # TODO: submit your ComfyUI workflow here, using src_path and tgt_path.
+    # For now, we just echo back paths to prove downloads work.
     return {
-        # Node IDs are strings in API format
-        "1": {  # LoadImage
-            "class_type": "LoadImage",
-            "inputs": {
-                "image": input_filename
-            }
-        },
-        "2": {  # SaveImage
-            "class_type": "SaveImage",
-            "inputs": {
-                "images": ["1", "IMAGE"]
-            }
-        }
+        "ok": True,
+        "message": "Inputs downloaded. Wire your ComfyUI workflow call next.",
+        "source_path": str(src_path),
+        "target_path": str(tgt_path),
+        "output_dir": str(OUTPUT_DIR),
     }
 
-# -------- Handler --------
+# -----------------------------
+# RunPod handler
+# -----------------------------
+def handler(event: Dict[str, Any]) -> Dict[str, Any]:
+    body = event.get("input") or {}
+    op = (body.get("op") or body.get("operation") or "").lower().strip()
 
-def handler(event):
-    """
-    Supported ops:
-      - {"op": "health_check"}
-      - {"op": "faceswap", "source_url" or "source_b64", "target_url" or "target_b64"}
-        (currently passthrough to validate E2E; swaps will be wired next)
-    """
-    _ensure_dirs()
-    inp = event.get("input", {}) if isinstance(event, dict) else {}
-    op = inp.get("op") or inp.get("operation")
+    if op in ("", "health", "health_check", "ping"):
+        return op_health_check(body)
+    elif op in ("faceswap", "swap", "face_swap"):
+        return op_faceswap(body)
+    else:
+        raise RuntimeError(f"Unknown op '{op}'.")
 
-    if op == "health_check":
-        return {"ok": _ok(), "comfy_url": COMFY_URL}
-
-    if op == "faceswap":
-        # Download (or decode) the two images
-        sid = f"src_{uuid.uuid4().hex}.png"
-        tid = f"tgt_{uuid.uuid4().hex}.png"
-        src_path = os.path.join(INPUT_DIR, sid)
-        tgt_path = os.path.join(INPUT_DIR, tid)
-
-        try:
-            if "source_url" in inp:
-                _download(inp["source_url"], src_path)
-            elif "source_b64" in inp:
-                _save_b64(inp["source_b64"], src_path)
-            else:
-                return {"error": "Provide 'source_url' or 'source_b64'."}
-
-            if "target_url" in inp:
-                _download(inp["target_url"], tgt_path)
-            elif "target_b64" in inp:
-                _save_b64(inp["target_b64"], tgt_path)
-            else:
-                return {"error": "Provide 'target_url' or 'target_b64'."}
-        except Exception as e:
-            return {"error": f"Failed to fetch inputs: {e}"}
-
-        # For now: passthrough the SOURCE image -> SaveImage, to verify the pipeline.
-        # After confirmation, we’ll replace this with your actual faceswap workflow.
-        try:
-            prompt = _build_passthrough_prompt(sid)
-            result = _comfy_prompt(prompt)
-            # Gather saved files
-            saved = []
-            outputs = result.get("outputs", {})
-            for node_id, node_out in outputs.items():
-                # SaveImage writes under output dir; the API returns file info under "images"
-                images = node_out.get("images") or []
-                for im in images:
-                    # Comfy returns {"filename": "...", "subfolder": "...", "type": "output"}
-                    filename = im.get("filename")
-                    if filename:
-                        saved.append({
-                            "filename": filename,
-                            "path": os.path.join(OUTPUT_DIR, filename)
-                        })
-            return {
-                "ok": True,
-                "note": "Passthrough complete (this proves E2E). Swap wiring comes next.",
-                "outputs": saved
-            }
-        except Exception as e:
-            return {"error": f"ComfyUI prompt failed: {e}"}
-
-    # default
-    return {"error": f"Unknown op '{op}'."}
-
-# Start the RunPod job loop
 runpod.serverless.start({"handler": handler})
