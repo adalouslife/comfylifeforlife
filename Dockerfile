@@ -1,44 +1,67 @@
-# CUDA 12.1 + Ubuntu base (as you used)
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+# ===== Base image =====
+FROM runpod/pytorch:2.5.1-py3.10-cuda12.1.1
 
+# Avoid interactive tzdata etc.
 ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    WORKDIR=/workspace
+    UV_HTTP_TIMEOUT=180
 
-WORKDIR ${WORKDIR}
-
-# OS deps + Python
+# ===== OS deps =====
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-venv python3-pip \
-        git curl ca-certificates wget tini ffmpeg \
-    && ln -sf /usr/bin/python3 /usr/bin/python \
-    && rm -rf /var/lib/apt/lists/*
+    git wget curl ca-certificates ffmpeg tini \
+ && rm -rf /var/lib/apt/lists/*
 
-# ComfyUI
-RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git ${WORKDIR}/ComfyUI
+# Ensure `python` exists (some images only have python3)
+RUN ln -sf /usr/bin/python3 /usr/bin/python || true
 
-# Copy repo files
-COPY requirements.txt ${WORKDIR}/requirements.txt
-COPY install_custom_nodes.py ${WORKDIR}/install_custom_nodes.py
-COPY custom_nodes.txt ${WORKDIR}/custom_nodes.txt
-COPY download_models.sh ${WORKDIR}/download_models.sh
-COPY handler.py ${WORKDIR}/handler.py
-COPY start.sh ${WORKDIR}/start.sh
-COPY comfyui ${WORKDIR}/comfyui
+# ===== Workspace layout =====
+WORKDIR /workspace
 
-# Python deps
-RUN python3 -m pip install --upgrade pip \
-    && python3 -m pip install -r ${WORKDIR}/requirements.txt
+# Clone ComfyUI at a known-good commit
+# (You can bump this later if needed; pinning avoids random upstream breaks.)
+RUN git clone https://github.com/comfyanonymous/ComfyUI.git && \
+    cd ComfyUI && \
+    git rev-parse HEAD > /workspace/COMFY_COMMIT.txt
 
-# Custom nodes + models (best-effort)
-RUN python3 ${WORKDIR}/install_custom_nodes.py || true
-RUN bash ${WORKDIR}/download_models.sh || true
+# Install ComfyUI requirements
+RUN python3 -m pip install --no-cache-dir -r /workspace/ComfyUI/requirements.txt
 
-# Comfy ports are local to container; RunPod hits the handler (8000)
-EXPOSE 8000
-EXPOSE 8188
+# ===== App files =====
+# (We keep your repo code in /workspace/app)
+COPY start.sh /workspace/app/start.sh
+COPY handler.py /workspace/app/handler.py
+COPY requirements.txt /workspace/app/requirements.txt
 
-# Use tini + python handler
+# Any optional lists/scripts you have; safe to copy if present.
+# (If you don't have them, Docker will still build — they aren't required steps.)
+COPY custom_nodes.txt /workspace/app/custom_nodes.txt
+COPY install_custom_nodes.py /workspace/app/install_custom_nodes.py
+COPY download_models.sh /workspace/app/download_models.sh
+
+# Python deps for the handler/utility code
+RUN python3 -m pip install --no-cache-dir -r /workspace/app/requirements.txt || true
+# Minimal hardens (in case requirements.txt is empty)
+RUN python3 -m pip install --no-cache-dir runpod requests pillow
+
+# Make entry executable
+RUN chmod +x /workspace/app/start.sh
+
+# Provide standard dirs (match your env)
+RUN mkdir -p /workspace/ComfyUI/input /workspace/ComfyUI/output /workspace/ComfyUI/models
+
+# ===== Environment =====
+ENV COMFY_DIR=/workspace/ComfyUI \
+    COMFY_HOST=127.0.0.1 \
+    COMFY_PORT=8188 \
+    RP_HANDLER_PORT=8000 \
+    INPUT_DIR=/workspace/ComfyUI/input \
+    OUTPUT_DIR=/workspace/ComfyUI/output
+
+EXPOSE 8000 8188
+
+# Use tini as PID1 for correct signal handling
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["python3", "-u", "handler.py"]
+
+# Start script:
+CMD ["bash", "-lc", "/workspace/app/start.sh"]
