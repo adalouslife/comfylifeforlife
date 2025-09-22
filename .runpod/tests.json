@@ -1,0 +1,15 @@
+{
+  "tests": [
+    {
+      "name": "ping_smoke",
+      "input": { "op": "ping" },
+      "timeout": 12000
+    }
+  ],
+  "config": {
+    "cpuFlavor": "CPU-0.5C-1GB",
+    "env": [
+      { "key": "RUNPOD_TEST_MODE", "value": "true" }
+    ]
+  }
+}
