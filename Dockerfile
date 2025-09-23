@@ -1,40 +1,45 @@
-# ===== Base: stable CUDA 12.1.1 + cuDNN on Ubuntu 22.04 =====
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+# Base image with CUDA and Ubuntu 22.04
+FROM runpod/base:0.5.4-cuda12.1.1-devel-ubuntu22.04
 
-# Keep apt non-interactive
-ENV DEBIAN_FRONTEND=noninteractive \
-    PIP_NO_CACHE_DIR=1 \
-    PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+ENV DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-lc"]
 
-# Core OS deps + Python + useful tools
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.10 python3-pip python3-venv \
-        git curl wget ca-certificates \
-        ffmpeg libgl1 \
-    && ln -sf /usr/bin/python3 /usr/local/bin/python \
-    && ln -sf /usr/bin/pip3    /usr/local/bin/pip \
-    && rm -rf /var/lib/apt/lists/*
+# System deps (curl + ffmpeg + git + python3 + pip)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      git curl ca-certificates wget unzip ffmpeg \
+      libgl1 libglib2.0-0 python3 python3-pip && \
+    rm -rf /var/lib/apt/lists/* && \
+    ln -sf /usr/bin/python3 /usr/bin/python && \
+    python3 -m pip install --upgrade pip
 
-# Workdir
 WORKDIR /workspace
 
-# Python deps
-COPY requirements.txt .
-RUN python -m pip install --upgrade pip && \
-    pip install -r requirements.txt
+# Install Torch (CUDA 12.1 wheels)
+RUN pip install --extra-index-url https://download.pytorch.org/whl/cu121 \
+      "torch==2.3.1+cu121" "torchvision==0.18.1+cu121" "torchaudio==2.3.1+cu121"
 
-# App code
-COPY . .
+# Clone ComfyUI once (pinned)
+RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git /workspace/ComfyUI
 
-# ComfyUI ports (internal) + handler port
-EXPOSE 8188 8000
+# Requirements for the handler and utilities
+COPY requirements.txt /workspace/requirements.txt
+RUN pip install -r /workspace/requirements.txt
 
-# Default envs the handler expects
-ENV RP_HANDLER_PORT=8000 \
-    COMFY_MODE=production \
-    INPUT_DIR=/workspace/ComfyUI/input \
-    OUTPUT_DIR=/workspace/ComfyUI/output
+# Copy the rest of your repo
+COPY . /workspace
 
-# Start the RunPod serverless handler (handler.py: run)
-CMD ["python", "-u", "-m", "runpod.serverless.start", "--handler", "handler.run"]
+# Make scripts executable
+RUN chmod +x /workspace/start.sh || true
+
+# Default environment (can be overridden in RunPod UI)
+ENV COMFY_PORT=8188
+ENV INPUT_DIR=/workspace/ComfyUI/input
+ENV OUTPUT_DIR=/workspace/ComfyUI/output
+ENV WORKFLOW_PATH=/workspace/comfyui/workflows/APIAutoFaceACE.json
+ENV STORAGE_DIR=/runpod-volume
+
+EXPOSE 8188
+
+# Start both Comfy and the handler
+CMD ["bash", "-lc", "/workspace/start.sh"]
