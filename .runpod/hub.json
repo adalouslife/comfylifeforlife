@@ -1,6 +1,6 @@
 {
-  "title": "Comfy Faceswaper Worker",
-  "description": "Fast health test + full GPU faceswap via ComfyUI",
+  "title": "Comfy Faceswaper",
+  "description": "Fast health test + full faceswap via ComfyUI",
   "type": "serverless",
   "category": "image",
   "iconUrl": "https://raw.githubusercontent.com/comfyanonymous/ComfyUI/master/comfyui.png",
