@@ -24,3 +24,6 @@ RUN chmod +x $WORKSPACE/*.sh
 
 EXPOSE 8000 8188
 CMD ["bash", "start.sh"]
+
+# after you clone ComfyUI into /workspace/ComfyUI
+COPY comfyui/workflows/APIAutoFaceACE.json /workspace/ComfyUI/workflows/APIAutoFaceACE.json
