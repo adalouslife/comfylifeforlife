@@ -1,0 +1,26 @@
+{
+  "title": "Comfy Faceswap Worker",
+  "description": "Fast health test + full GPU faceswap via ComfyUI workflow.",
+  "type": "serverless",
+  "category": "image",
+  "iconUrl": "https://raw.githubusercontent.com/comfyanonymous/ComfyUI/master/comfyui.png",
+  "config": {
+    "runsOn": "GPU",
+    "containerDiskInGb": 40,
+    "presets": [
+      {
+        "name": "Default",
+        "defaults": {
+          "INPUT_DIR": "/workspace/inputs",
+          "OUTPUT_DIR": "/workspace/outputs",
+          "COMFY_PORT": "8188"
+        }
+      }
+    ],
+    "env": [
+      { "key": "INPUT_DIR", "value": "/workspace/inputs" },
+      { "key": "OUTPUT_DIR", "value": "/workspace/outputs" },
+      { "key": "COMFY_PORT", "value": "8188" }
+    ]
+  }
+}
