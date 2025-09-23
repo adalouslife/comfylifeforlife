@@ -1,6 +1,6 @@
 {
   "title": "Comfy Faceswap Worker",
-  "description": "GPU worker that runs ComfyUI and a faceswap workflow. Tests only ping/health on CPU for fast approval.",
+  "description": "GPU worker that runs ComfyUI and a faceswap workflow. Tests only ping/health on CPU for approval",
   "type": "serverless",
   "category": "image",
   "iconUrl": "https://raw.githubusercontent.com/comfyanonymous/ComfyUI/master/comfyui.png",
