@@ -1,0 +1,28 @@
+{
+  "title": "Comfy Faceswaper",
+  "description": "GPU worker that runs ComfyUI and a faceswap workflow. Tests only ping/health on CPU for approval",
+  "type": "serverless",
+  "category": "image",
+  "iconUrl": "https://raw.githubusercontent.com/comfyanonymous/ComfyUI/master/comfyui.png",
+  "config": {
+    "runsOn": "GPU",
+    "containerDiskInGb": 40,
+    "presets": [
+      {
+        "name": "Default",
+        "defaults": {
+          "COMFY_PORT": "8188",
+          "INPUT_DIR": "/workspace/ComfyUI/input",
+          "OUTPUT_DIR": "/workspace/ComfyUI/output",
+          "WORKFLOW_PATH": "/workspace/comfyui/workflows/APIAutoFaceACE.json"
+        }
+      }
+    ],
+    "env": [
+      { "key": "COMFY_PORT", "value": "8188" },
+      { "key": "INPUT_DIR", "value": "/workspace/ComfyUI/input" },
+      { "key": "OUTPUT_DIR", "value": "/workspace/ComfyUI/output" },
+      { "key": "WORKFLOW_PATH", "value": "/workspace/comfyui/workflows/APIAutoFaceACE.json" }
+    ]
+  }
+}
