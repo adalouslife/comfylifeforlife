@@ -1,3 +1,6 @@
 runpod==1.7.13
-requests>=2.31.0
-pillow>=10.3.0
+requests>=2.32.3
+urllib3>=2.2.2
+pillow>=10.4.0
+aiohttp>=3.9.5
+tenacity>=9.0.0
