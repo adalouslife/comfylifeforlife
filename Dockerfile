@@ -1,29 +1,48 @@
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+# ========= Base image =========
+FROM runpod/pytorch:3.10-2.3.1-12.1.1
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1 \
-    WORKSPACE=/workspace
+# Keep the workspace tidy
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-WORKDIR $WORKSPACE
+WORKDIR /workspace
 
-# System deps
-RUN apt-get update && apt-get install -y \
-    python3 python3-pip git wget curl unzip && \
-    ln -s /usr/bin/python3 /usr/bin/python && \
-    pip3 install --upgrade pip setuptools wheel
+# ---------- System deps ----------
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    git wget curl ca-certificates ffmpeg libgl1 \
+ && rm -rf /var/lib/apt/lists/*
 
-# Clone ComfyUI
-RUN git clone https://github.com/comfyanonymous/ComfyUI.git
+# ---------- Copy repo ----------
+# (we keep the same layout you already have)
+COPY . /workspace
 
-# Python deps
-RUN pip install -r ComfyUI/requirements.txt runpod
+# ---------- Python deps ----------
+# ComfyUI deps + runpod handler + anything your requirements specify
+RUN pip install --upgrade pip \
+ && pip install -r /workspace/requirements.txt \
+ && pip install runpod
 
-# Copy our repo files
-COPY . $WORKSPACE
-RUN chmod +x $WORKSPACE/*.sh
+# ---------- Get ComfyUI ----------
+RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git /workspace/ComfyUI \
+ && pip install -r /workspace/ComfyUI/requirements.txt
 
-EXPOSE 8000 8188
-CMD ["bash", "start.sh"]
+# ---------- Install custom nodes (from your repo scripts) ----------
+# This clones the packs listed in custom_nodes.txt into ComfyUI/custom_nodes
+RUN python3 /workspace/install_custom_nodes.py
 
-# after you clone ComfyUI into /workspace/ComfyUI
-COPY comfyui/workflows/APIAutoFaceACE.json /workspace/ComfyUI/workflows/APIAutoFaceACE.json
+# ---------- Download model files (from your repo script) ----------
+# This should populate /workspace/ComfyUI/models/* with what your workflow needs
+RUN bash /workspace/download_models.sh
+
+# Pre-create IO dirs so handler can drop inputs/outputs
+RUN mkdir -p /workspace/inputs /workspace/outputs
+
+# ---------- Ports ----------
+# ComfyUI UI/API
+EXPOSE 8188
+# RunPod handler port (internal)
+EXPOSE 8000
+
+# ---------- Start both ----------
+# start.sh launches ComfyUI in background, then keeps handler in foreground (required by RunPod)
+ENTRYPOINT ["/bin/bash", "/workspace/start.sh"]
