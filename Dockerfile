@@ -1,5 +1,5 @@
 # ========= Base image =========
-FROM runpod/pytorch:3.10-2.3.1-12.1.1
+FROM runpod/pytorch:2.1.1-py3.10-cuda12.1.1-devel-ubuntu22.04
 
 # Keep the workspace tidy
 ENV PYTHONDONTWRITEBYTECODE=1 \
