@@ -1,29 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Defaults
+# Defaults (can be overridden by env)
 export INPUT_DIR="${INPUT_DIR:-/workspace/inputs}"
 export OUTPUT_DIR="${OUTPUT_DIR:-/workspace/outputs}"
 export COMFY_HOST="${COMFY_HOST:-127.0.0.1}"
 export COMFY_PORT="${COMFY_PORT:-8188}"
+export RP_HANDLER_PORT="${RP_HANDLER_PORT:-8000}"
 
 mkdir -p "$INPUT_DIR" "$OUTPUT_DIR"
 
-# Start ComfyUI
-# - assumes repo at /workspace/ComfyUI
+# ---- start ComfyUI ----
 cd /workspace/ComfyUI
 
-# If custom nodes fail to import, ComfyUI exits; run once and tail logs in worker
+# If Comfy ever crashes due to a missing import, we want logs to show it.
 python3 main.py \
   --listen 0.0.0.0 \
   --port "${COMFY_PORT}" \
   --output-directory "${OUTPUT_DIR}" \
-  --input-directory "${INPUT_DIR}" &
+  --input-directory "${INPUT_DIR}" \
+  &
+
 COMFY_PID=$!
 
-# Give it a short breath so health_check has something to reach
+# Small grace so health check has something to ping
 sleep 2
 
-# Start RunPod handler (this process must stay in foreground)
+# ---- start RunPod handler (foreground) ----
 cd /workspace
-python3 -u handler.py
+exec python3 -u handler.py
