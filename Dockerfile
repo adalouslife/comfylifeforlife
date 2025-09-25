@@ -1,10 +1,10 @@
 # ========= Base image =========
+# Stable + available image on RunPod hub
 FROM runpod/pytorch:2.1.1-py3.10-cuda12.1.1-devel-ubuntu22.04
 
 # Keep the workspace tidy
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
-
 WORKDIR /workspace
 
 # ---------- System deps ----------
@@ -13,25 +13,22 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
  && rm -rf /var/lib/apt/lists/*
 
 # ---------- Copy repo ----------
-# (we keep the same layout you already have)
 COPY . /workspace
 
 # ---------- Python deps ----------
-# ComfyUI deps + runpod handler + anything your requirements specify
+# Your requirements currently only include runpod libs; Comfy deps come from ComfyUI repo
 RUN pip install --upgrade pip \
  && pip install -r /workspace/requirements.txt \
- && pip install runpod
+ && pip install runpod requests tenacity
 
 # ---------- Get ComfyUI ----------
 RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git /workspace/ComfyUI \
  && pip install -r /workspace/ComfyUI/requirements.txt
 
-# ---------- Install custom nodes (from your repo scripts) ----------
-# This clones the packs listed in custom_nodes.txt into ComfyUI/custom_nodes
+# ---------- Install custom nodes ----------
 RUN python3 /workspace/install_custom_nodes.py
 
-# ---------- Download model files (from your repo script) ----------
-# This should populate /workspace/ComfyUI/models/* with what your workflow needs
+# ---------- Download models your workflow needs ----------
 RUN bash /workspace/download_models.sh
 
 # Pre-create IO dirs so handler can drop inputs/outputs
@@ -44,5 +41,6 @@ EXPOSE 8188
 EXPOSE 8000
 
 # ---------- Start both ----------
-# start.sh launches ComfyUI in background, then keeps handler in foreground (required by RunPod)
+# start.sh launches ComfyUI in background, waits for health,
+# then keeps handler in foreground (required by RunPod)
 ENTRYPOINT ["/bin/bash", "/workspace/start.sh"]
