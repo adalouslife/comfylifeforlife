@@ -2,208 +2,236 @@ import os
 import io
 import json
 import time
+import uuid
 import runpod
-import shutil
+import base64
 import logging
 import requests
-from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
+# ------------ Env ------------
 COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1")
 COMFY_PORT = int(os.environ.get("COMFY_PORT", "8188"))
 COMFY_URL  = f"http://{COMFY_HOST}:{COMFY_PORT}"
 
-INPUT_DIR  = Path(os.environ.get("INPUT_DIR", "/workspace/inputs"))
-OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/workspace/outputs"))
-WORKFLOW   = Path("/workspace/comfyui/workflows/APIAutoFaceACE.json")
+INPUT_DIR  = os.environ.get("INPUT_DIR", "/workspace/inputs")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/workspace/outputs")
+WORKFLOW_PATH = os.environ.get("WORKFLOW_PATH", "/workspace/comfyui/workflows/APIAutoFaceACE.json")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# Optional: upload result to Catbox for a public URL
+USE_CATBOX = os.environ.get("USE_CATBOX", "false").lower() == "true"
 
-# ---------- helpers ----------
-def _http_get_json(url: str, timeout=5) -> Dict[str, Any]:
-    r = requests.get(url, timeout=timeout)
+# ------------ Logging ------------
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+log = logging.getLogger(__name__)
+
+# ------------ HTTP helpers ------------
+session = requests.Session()
+session.headers.update({"Accept": "application/json"})
+
+def _comfy(path: str) -> str:
+    return f"{COMFY_URL.rstrip('/')}/{path.lstrip('/')}"
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+@retry(reraise=True, stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.8, min=0.5, max=6))
+def _http_get(url: str, **kw) -> requests.Response:
+    return session.get(url, timeout=30, **kw)
+
+@retry(reraise=True, stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.8, min=0.5, max=6))
+def _http_post(url: str, **kw) -> requests.Response:
+    return session.post(url, timeout=60, **kw)
+
+# ----------- Catbox upload -----------
+@retry(reraise=True, stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
+def _catbox_upload(file_path: str) -> str:
+    # https://catbox.moe/tools.php (simple upload)
+    with open(file_path, "rb") as f:
+        files = {'fileToUpload': (os.path.basename(file_path), f)}
+        data = {'reqtype': 'fileupload'}
+        r = requests.post("https://catbox.moe/user/api.php", files=files, data=data, timeout=60)
     r.raise_for_status()
-    return r.json()
+    url = r.text.strip()
+    if not url.startswith("https://"):
+        raise RuntimeError(f"Unexpected catbox response: {url[:200]}")
+    return url
 
-def _wait_for_comfy(timeout_sec=60):
-    """Wait until ComfyUI answers /system_stats."""
-    start = time.time()
-    while time.time() - start < timeout_sec:
-        try:
-            _ = _http_get_json(f"{COMFY_URL}/system_stats", timeout=3)
-            return True
-        except Exception:
-            time.sleep(1)
-    raise RuntimeError(f"ComfyUI did not come up in time: {COMFY_URL}/system_stats")
+# ----------- Utilities -----------
+def _basename_from_url(u: str) -> str:
+    name = u.split("?")[0].rstrip("/").split("/")[-1] or f"file-{uuid.uuid4().hex}"
+    # strip any accidental folder traversal
+    name = name.replace("..", "").replace("/", "_")
+    return name
 
-def _download(url: str, dest: Path, max_retries=4) -> Path:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    last_err = None
-    for i in range(max_retries):
-        try:
-            with requests.get(url, stream=True, timeout=20) as r:
-                r.raise_for_status()
-                with open(dest, "wb") as f:
-                    shutil.copyfileobj(r.raw, f)
-            return dest
-        except Exception as e:
-            last_err = e
-            time.sleep(1 + i)  # backoff
-    raise RuntimeError(f"Failed to fetch inputs: {last_err}")
+@retry(reraise=True, stop=stop_after_attempt(4), wait=wait_exponential(multiplier=0.6, min=0.5, max=6))
+def _download_to(url: str, dest_dir: str) -> str:
+    os.makedirs(dest_dir, exist_ok=True)
+    fname = _basename_from_url(url)
+    dest = os.path.join(dest_dir, fname)
+    log.info(f"Downloading {url} -> {dest}")
+    with session.get(url, stream=True, timeout=60) as r:
+        r.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1 << 15):
+                if chunk:
+                    f.write(chunk)
+    return dest
 
 def _load_workflow() -> Dict[str, Any]:
-    with open(WORKFLOW, "r", encoding="utf-8") as f:
-        return json.load(f)
+    with open(WORKFLOW_PATH, "r", encoding="utf-8") as f:
+        wf = json.load(f)
+    if "nodes" not in wf:
+        # support Comfy's graph format wrapped with 'workflow' sometimes
+        wf = wf.get("workflow", wf)
+    return wf
 
-def _save_debug(obj: Any, name: str):
-    try:
-        p = Path(f"/workspace/debug_{name}.json")
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(obj, f, indent=2)
-    except Exception:
-        pass
+def _patch_workflow_images(wf: Dict[str, Any], src_basename: str, face_basename: str) -> Dict[str, Any]:
+    """
+    Find first two LoadImage nodes and set their 'image' values to the basenames
+    that were saved into ComfyUI input directory. This matches your APIAutoFaceACE.json.
+    """
+    load_nodes = [n for n in wf.get("nodes", []) if n.get("class_type") in ("LoadImage", "LoadImageMask", "Image Load", "Load Image")]  # be generous
+    if len(load_nodes) < 2:
+        raise ValueError("Workflow must contain at least two LoadImage nodes (source + face).")
 
-def _queue_prompt(prompt: Dict[str, Any]) -> str:
-    # Comfy expects {"prompt": {graph...}, "client_id": "..."} but client_id is optional server-side.
-    payload = {"prompt": prompt}
-    r = requests.post(f"{COMFY_URL}/prompt", json=payload, timeout=30)
-    if not r.ok:
-        # Bubble up Comfy’s own error text so we see which node failed
-        raise requests.HTTPError(f"{r.status_code} {r.reason}: {r.text}", response=r)
-    return r.json().get("prompt_id", "")
+    # By your saved graph: node 420 = source, node 240 = face
+    # But we still assign deterministically: the one whose current value contains 'newfaces' (or 'face') gets face.
+    def wants_face(node):
+        d = node.get("inputs", {}).get("image", "")
+        return any(k in str(d).lower() for k in ("newfaces", "face", "target"))
 
-def _get_history(prompt_id: str) -> Dict[str, Any]:
-    r = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=30)
+    face_node = next((n for n in load_nodes if wants_face(n)), load_nodes[0])
+    remaining = [n for n in load_nodes if n is not face_node]
+    src_node = remaining[0]
+
+    # Patch
+    face_node.setdefault("inputs", {})["image"] = face_basename
+    src_node.setdefault("inputs", {})["image"]  = src_basename
+    return wf
+
+def _queue_prompt(wf: Dict[str, Any]) -> str:
+    payload = {"prompt": wf}
+    r = _http_post(_comfy("/prompt"), json=payload)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    prompt_id = data.get("prompt_id") or data.get("promptId") or data.get("id")
+    if not prompt_id:
+        raise RuntimeError(f"Missing prompt_id in response: {data}")
+    return prompt_id
 
-def _collect_images(history: Dict[str, Any]) -> Dict[str, str]:
+def _collect_output(prompt_id: str, timeout_s: int = 300) -> Dict[str, Any]:
     """
-    Returns { node_id: absolute_file_path } for all images produced.
+    Poll /history/{id} until images are available or timeout.
     """
-    files: Dict[str, str] = {}
-    for _pid, item in history.items():
-        for node_id, node_output in item.get("outputs", {}).items():
-            for k, out in node_output.items():
-                if isinstance(out, list):
-                    for entry in out:
-                        if isinstance(entry, dict) and entry.get("type") == "image":
-                            fp = Path(OUTPUT_DIR, entry["subfolder"], f"{entry['filename']}")
-                            files[node_id] = str(fp)
-    return files
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        resp = _http_get(_comfy(f"/history/{prompt_id}"))
+        if resp.status_code == 200:
+            j = resp.json()
+            # Comfy returns { id: { "outputs": { node_id: { "images": [...] } } } }
+            entry = j.get(prompt_id) or j
+            outputs = (entry or {}).get("outputs", {})
+            any_images = []
+            for node_id, out in outputs.items():
+                imgs = out.get("images") or []
+                for im in imgs:
+                    # Each record has "filename" that's already saved under OUTPUT_DIR
+                    if "filename" in im:
+                        any_images.append(os.path.join(OUTPUT_DIR, im["filename"]))
+            if any_images:
+                return {"images": any_images}
+        time.sleep(1.0)
 
-# ---------- ops ----------
-def op_ping(_input: Dict[str, Any]) -> Dict[str, Any]:
+    raise TimeoutError(f"Timed out waiting for output of prompt {prompt_id}")
+
+# ----------- Ops -----------
+def op_ping(_: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": True}
 
-def op_health_check(_input: Dict[str, Any]) -> Dict[str, Any]:
-    _wait_for_comfy(timeout_sec=20)
-    stats = _http_get_json(f"{COMFY_URL}/system_stats", timeout=5)
-    return {"ok": True, "stats": stats}
-
-def op_version(_input: Dict[str, Any]) -> Dict[str, Any]:
-    _wait_for_comfy(timeout_sec=10)
-    # best-effort info without failing if missing
-    info = {"ok": True, "comfy_url": COMFY_URL}
+def op_health_check(_: Dict[str, Any]) -> Dict[str, Any]:
     try:
-        info["stats"] = _http_get_json(f"{COMFY_URL}/system_stats", timeout=5)
+        r = _http_get(_comfy("/system_stats"))
+        r.raise_for_status()
+        return {"ok": True, "stats": r.json()}
     except Exception as e:
-        info["stats_error"] = str(e)
-    return info
+        return {"ok": False, "error": str(e)}
 
-def op_faceswap(_input: Dict[str, Any]) -> Dict[str, Any]:
+def op_faceswap(inp: Dict[str, Any]) -> Dict[str, Any]:
     """
-    input: {
-      "source_url": "...",   # face to extract (or driving face)
-      "target_url": "...",   # image whose face will be replaced
+    input:
+    {
+      "source_url": "https://...",
+      "face_url": "https://...",
+      "upload": true|false   # optional: upload to Catbox and return a public URL
     }
     """
-    source_url = _input.get("source_url")
-    target_url = _input.get("target_url")
+    source_url = inp.get("source_url")
+    face_url   = inp.get("face_url")
+    if not source_url or not face_url:
+        raise ValueError("Provide both 'source_url' and 'face_url'.")
 
-    if not source_url or not target_url:
-        return {"ok": False, "error": "Provide 'source_url' and 'target_url'."}
-
-    _wait_for_comfy(timeout_sec=40)
-
-    # 1) fetch inputs
-    src_path = _download(source_url, INPUT_DIR / "source.jpg")
-    tgt_path = _download(target_url, INPUT_DIR / "target.jpg")
-
-    # 2) load & patch workflow (two LoadImage nodes)
-    wf = _load_workflow()
-
-    # Heuristic: find the first two nodes whose class_type is "LoadImage"
-    # and set their `inputs.image` fields to our filenames.
-    replaced = 0
-    for node_id, node in wf.items():
-        if isinstance(node, dict) and node.get("class_type") == "LoadImage":
-            if replaced == 0:
-                node.setdefault("inputs", {})["image"] = src_path.name
-                replaced += 1
-            elif replaced == 1:
-                node.setdefault("inputs", {})["image"] = tgt_path.name
-                replaced += 1
-            if replaced >= 2:
-                break
-
-    if replaced < 2:
-        return {"ok": False, "error": "Workflow does not contain two LoadImage nodes to patch."}
-
-    _save_debug(wf, "patched_prompt")
-
-    # 3) queue + wait
+    # 1) fetch inputs with retries
     try:
-        prompt_id = _queue_prompt(wf)
+        src_path  = _download_to(source_url, INPUT_DIR)
+        face_path = _download_to(face_url,   INPUT_DIR)
     except Exception as e:
-        return {"ok": False, "error": f"Pipeline failed: {e}"}
+        raise RuntimeError(f"Failed to fetch inputs: {e}")
 
-    # Comfy renders async; small wait & poll history
-    time.sleep(1.0)
-    history = _get_history(prompt_id)
-    images = _collect_images(history)
+    src_base  = os.path.basename(src_path)
+    face_base = os.path.basename(face_path)
 
-    if not images:
-        return {"ok": False, "error": "No images produced. Check nodes and models."}
+    # 2) load + patch workflow
+    wf = _load_workflow()
+    wf = _patch_workflow_images(wf, src_base, face_base)
 
-    # 4) Return local file paths; if you want URLs, serve them via S3 or a tiny HTTP server.
-    # For now we return absolute paths from the container. (You can hook your S3 volume here.)
+    # 3) queue prompt
+    prompt_id = _queue_prompt(wf)
+
+    # 4) collect output
+    result = _collect_output(prompt_id, timeout_s=int(os.environ.get("COMFY_TIMEOUT", "480")))
+
+    # 5) publish URLs if requested
+    image_paths = result["images"]
+    public_urls = []
+    if USE_CATBOX or str(inp.get("upload")).lower() == "true":
+        for p in image_paths:
+            try:
+                public_urls.append(_catbox_upload(p))
+            except Exception as e:
+                log.warning(f"Catbox upload failed for {p}: {e}")
+
     return {
         "ok": True,
-        "prompt_id": prompt_id,
-        "images": images,
+        "output_paths": image_paths,
+        "urls": public_urls
     }
 
-# ---------- dispatch ----------
+# ---------- Router ----------
 OP_MAP = {
     "ping": op_ping,
     "health_check": op_health_check,
-    "version": op_version,
-    "faceswap": op_faceswap,
+    "faceswap": op_faceswap
 }
 
 def handler(event):
+    """RunPod handler entrypoint."""
     body = event.get("input") or {}
-    op = (body.get("op") or "").strip().lower()
-
+    op = (body.get("op") or body.get("operation") or "").lower().strip()
     if not op:
-        # default tiny smoke so tests can pass without GPU work
-        return {"ok": True}
+        # Keep tests decoupled from your repo build
+        # A no-op path returns success quickly.
+        return {"ok": True, "message": "no-op"}
 
     fn = OP_MAP.get(op)
-    if fn is None:
-        return {"ok": False, "error": f"Unknown op {op}"}
+    if not fn:
+        return {"ok": False, "error": f"Unknown op '{op}'"}
 
     try:
         return fn(body)
     except Exception as e:
-        logging.exception("op failed")
+        # Surface a readable error and avoid worker crash
         return {"ok": False, "error": str(e)}
 
-if __name__ == "__main__":
-    # Keep same signature for RunPod serverless
-    runpod.serverless.start(
-        { "handler": handler },
-        # Make sure the worker stays alive even if Comfy launches a little later
-        handler_port=int(os.environ.get("RP_HANDLER_PORT", "8000")),
-    )
+runpod.serverless.start({"handler": handler})
